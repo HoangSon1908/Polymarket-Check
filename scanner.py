@@ -1,3 +1,4 @@
+import json
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -34,7 +35,7 @@ st.set_page_config(
 )
 
 
-# --- HÀM HỖ TRỢ GỌI DATA API V2 ---
+# --- HÀM HỖ TRỢ GỌI & PARSE DATA API V2 ---
 def request_data_api(path: str, params: dict, timeout: int = 12):
     """Ưu tiên gọi Data API /v2/, tự động thử đường dẫn gốc nếu endpoint chưa chuyển sang v2."""
     clean_path = path.lstrip("/")
@@ -50,24 +51,71 @@ def request_data_api(path: str, params: dict, timeout: int = 12):
     return last_resp
 
 
-def parse_leaderboard_row(row: dict) -> dict | None:
-    """Trích xuất linh hoạt dữ liệu từ phản hồi Leaderboard v2."""
+def extract_rows_and_cursor(payload):
+    """Tự động trích xuất danh sách bản ghi và next_cursor từ mọi cấu trúc JSON v2."""
+    if isinstance(payload, list):
+        return payload, None
+    if isinstance(payload, dict):
+        next_cursor = (
+            payload.get("next_cursor")
+            or payload.get("nextCursor")
+            or (payload.get("pagination") or {}).get("next_cursor")
+            or (payload.get("meta") or {}).get("next_cursor")
+        )
+        for key in ("data", "entries", "items", "results", "leaderboard", "traders", "users", "rankings"):
+            val = payload.get(key)
+            if isinstance(val, list):
+                return val, next_cursor
+        for val in payload.values():
+            if isinstance(val, list) and (not val or isinstance(val[0], dict)):
+                return val, next_cursor
+    return [], None
+
+
+def parse_leaderboard_row(row: dict):
+    """Trích xuất linh hoạt dữ liệu trader từ phản hồi Leaderboard v2 (snake_case & camelCase)."""
+    if not isinstance(row, dict):
+        return None
+
     wallet = (
-        row.get("proxyWallet")
+        row.get("proxy_wallet")
+        or row.get("proxyWallet")
+        or row.get("wallet_address")
+        or row.get("walletAddress")
         or row.get("address")
         or row.get("user")
         or row.get("wallet")
         or ""
-    ).strip().lower()
+    )
+    wallet = str(wallet).strip().lower()
+
+    if not re.match(r"^0x[a-f0-9]{40}$", wallet):
+        wallet = ""
+        for v in row.values():
+            if isinstance(v, str):
+                m = re.search(r"0x[a-fA-F0-9]{40}", v)
+                if m:
+                    wallet = m.group(0).lower()
+                    break
+
     if not wallet:
         return None
 
-    raw_pnl = row.get("pnl") if row.get("pnl") is not None else row.get("profit", 0)
-    raw_vol = row.get("vol") if row.get("vol") is not None else row.get("volume", 0)
+    raw_pnl = None
+    for k in ("pnl", "total_pnl", "totalPnl", "profit", "net_pnl", "netPnl"):
+        if row.get(k) is not None:
+            raw_pnl = row.get(k)
+            break
+
+    raw_vol = None
+    for k in ("volume", "vol", "total_volume", "totalVolume", "total_vol"):
+        if row.get(k) is not None:
+            raw_vol = row.get(k)
+            break
 
     try:
-        pnl = float(raw_pnl or 0)
-        vol = float(raw_vol or 0)
+        pnl = float(raw_pnl if raw_pnl is not None else 0)
+        vol = float(raw_vol if raw_vol is not None else 0)
     except (ValueError, TypeError):
         return None
 
@@ -75,14 +123,17 @@ def parse_leaderboard_row(row: dict) -> dict | None:
         return None
 
     username = (
-        row.get("userName")
+        row.get("user_name")
+        or row.get("userName")
         or row.get("username")
+        or row.get("pseudonym")
         or row.get("name")
+        or row.get("display_name")
         or f"{wallet[:6]}...{wallet[-4:]}"
     )
 
     return {
-        "Username": username,
+        "Username": str(username),
         "Wallet": wallet,
         "Profile": f"https://polymarket.com/{wallet}",
         "PnL ($)": round(pnl, 2),
@@ -96,6 +147,7 @@ def fetch_from_leaderboard(lb_category: str, time_period: str, max_pages: int, p
     """Lấy danh sách trader + PnL + Volume từ /v2/leaderboard bằng cursor pagination."""
     profiles = {}
     errors = []
+    sample_payload = None
     page_size = 50
     sort_modes = ["PNL", "VOLUME"]
     total_steps = max_pages * len(sort_modes)
@@ -118,22 +170,10 @@ def fetch_from_leaderboard(lb_category: str, time_period: str, max_pages: int, p
                 resp = request_data_api("leaderboard", params=req_params, timeout=12)
                 if resp is not None and resp.status_code == 200:
                     payload = resp.json()
-                    if isinstance(payload, dict):
-                        rows = (
-                            payload.get("data")
-                            or payload.get("results")
-                            or payload.get("leaderboard")
-                            or []
-                        )
-                        next_cursor = (
-                            payload.get("next_cursor")
-                            or payload.get("nextCursor")
-                            or (payload.get("pagination") or {}).get("next_cursor")
-                        )
-                    else:
-                        rows = payload if isinstance(payload, list) else []
-                        next_cursor = None
+                    if sample_payload is None:
+                        sample_payload = payload
 
+                    rows, next_cursor = extract_rows_and_cursor(payload)
                     if not rows:
                         break
 
@@ -161,7 +201,7 @@ def fetch_from_leaderboard(lb_category: str, time_period: str, max_pages: int, p
                 )
             time.sleep(0.08)
 
-    return profiles, errors
+    return profiles, errors, sample_payload
 
 
 def fetch_wallets_from_holders(tag_slug: str | None, sub_keyword: str, market_limit: int, progress_bar=None):
@@ -226,16 +266,21 @@ def fetch_wallets_from_holders(tag_slug: str | None, sub_keyword: str, market_li
                 timeout=10
             )
             if h_resp is not None and h_resp.status_code == 200:
-                payload = h_resp.json()
-                groups = payload.get("data", payload) if isinstance(payload, dict) else payload
+                groups, _ = extract_rows_and_cursor(h_resp.json())
                 for token_group in groups:
-                    for holder in token_group.get("holders", []):
+                    holders_list = token_group.get("holders", []) if isinstance(token_group, dict) else []
+                    for holder in holders_list:
                         w = (
-                            holder.get("proxyWallet")
+                            holder.get("proxy_wallet")
+                            or holder.get("proxyWallet")
                             or holder.get("wallet")
                             or holder.get("address")
                             or ""
-                        ).strip().lower()
+                        )
+                        w = str(w).strip().lower()
+                        if not re.match(r"^0x[a-f0-9]{40}$", w):
+                            m_w = re.search(r"0x[a-fA-F0-9]{40}", str(holder))
+                            w = m_w.group(0).lower() if m_w else ""
                         if w:
                             wallets.add(w)
             elif not errors and h_resp is not None:
@@ -260,11 +305,15 @@ def fetch_markets_traded_only(wallet: str) -> int:
         tr_resp = request_data_api("traded", params={"user": wallet}, timeout=10)
         if tr_resp is not None and tr_resp.status_code == 200:
             data = tr_resp.json()
-            if isinstance(data, dict):
-                val = data.get("traded") or data.get("marketsTraded") or data.get("count") or 0
-                return int(val)
             if isinstance(data, (int, float)):
                 return int(data)
+            if isinstance(data, dict):
+                for k in ("traded", "markets_traded", "marketsTraded", "count", "total"):
+                    if data.get(k) is not None:
+                        return int(data[k])
+                for v in data.values():
+                    if isinstance(v, (int, float)):
+                        return int(v)
     except Exception:
         pass
     return 0
@@ -282,12 +331,7 @@ def fetch_single_profile(wallet: str, time_period: str = "ALL"):
         if lb_resp is None or lb_resp.status_code != 200:
             return None
 
-        payload = lb_resp.json()
-        rows = (
-            payload.get("data") or payload.get("results") or payload.get("leaderboard") or []
-            if isinstance(payload, dict)
-            else payload
-        )
+        rows, _ = extract_rows_and_cursor(lb_resp.json())
         if not rows:
             return None
 
@@ -455,9 +499,10 @@ with tab_scan:
         tag_info = POLYMARKET_TAGS[selected_tag_label]
         progress = st.progress(0.0, text=f"Đang khởi tạo quét tag {selected_tag_label}...")
         api_errors = []
+        sample_payload = None
 
         if scan_source == "Bảng xếp hạng (Leaderboard)":
-            profiles_dict, api_errors = fetch_from_leaderboard(
+            profiles_dict, api_errors, sample_payload = fetch_from_leaderboard(
                 lb_category=tag_info["lb_cat"],
                 time_period=time_period,
                 max_pages=scan_depth,
@@ -487,6 +532,9 @@ with tab_scan:
 
         if raw_df.empty:
             st.warning("Không thu thập được dữ liệu ví nào trong đợt quét này. Bạn hãy thử đổi sang nguồn quét còn lại hoặc chọn Tag khác.")
+            if sample_payload is not None:
+                with st.expander("🔍 Xem cấu trúc dữ liệu thô API trả về"):
+                    st.code(json.dumps(sample_payload, indent=2)[:1500], language="json")
         else:
             st.session_state["raw_df"] = raw_df
 
