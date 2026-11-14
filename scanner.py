@@ -34,9 +34,66 @@ st.set_page_config(
 )
 
 
+# --- HÀM HỖ TRỢ GỌI DATA API V2 (CÓ FALLBACK) ---
+def request_data_api(path: str, params: dict, timeout: int = 12):
+    """Ưu tiên gọi Data API /v2/, tự động thử đường dẫn gốc nếu endpoint chưa chuyển sang v2."""
+    clean_path = path.lstrip("/")
+    urls = [f"{DATA_API}/v2/{clean_path}", f"{DATA_API}/{clean_path}"]
+    last_resp = None
+    for url in urls:
+        resp = requests.get(url, params=params, headers=HEADERS, timeout=timeout)
+        last_resp = resp
+        if resp.status_code == 200:
+            return resp
+        if resp.status_code not in (404, 410):
+            return resp
+    return last_resp
+
+
+def parse_leaderboard_row(row: dict) -> dict | None:
+    """Trích xuất linh hoạt dữ liệu từ phản hồi Leaderboard v2."""
+    wallet = (
+        row.get("proxyWallet")
+        or row.get("address")
+        or row.get("user")
+        or row.get("wallet")
+        or ""
+    ).strip().lower()
+    if not wallet:
+        return None
+
+    raw_pnl = row.get("pnl") if row.get("pnl") is not None else row.get("profit", 0)
+    raw_vol = row.get("vol") if row.get("vol") is not None else row.get("volume", 0)
+
+    try:
+        pnl = float(raw_pnl or 0)
+        vol = float(raw_vol or 0)
+    except (ValueError, TypeError):
+        return None
+
+    if vol <= 0:
+        return None
+
+    username = (
+        row.get("userName")
+        or row.get("username")
+        or row.get("name")
+        or f"{wallet[:6]}...{wallet[-4:]}"
+    )
+
+    return {
+        "Username": username,
+        "Wallet": wallet,
+        "Profile": f"https://polymarket.com/{wallet}",
+        "PnL ($)": round(pnl, 2),
+        "Volume ($)": round(vol, 2),
+        "PnL / Volume (%)": round((pnl / vol) * 100, 3),
+    }
+
+
 # --- HÀM LẤY DỮ LIỆU TỪ API POLYMARKET ---
 def fetch_from_leaderboard(lb_category: str, time_period: str, max_pages: int, progress_bar=None):
-    """Lấy trực tiếp danh sách trader + PnL + Volume từ /v1/leaderboard."""
+    """Lấy trực tiếp danh sách trader + PnL + Volume từ /v2/leaderboard."""
     profiles = {}
     errors = []
     page_size = 50
@@ -49,8 +106,8 @@ def fetch_from_leaderboard(lb_category: str, time_period: str, max_pages: int, p
             step += 1
             offset = page * page_size
             try:
-                resp = requests.get(
-                    f"{DATA_API}/v1/leaderboard",
+                resp = request_data_api(
+                    "leaderboard",
                     params={
                         "category": lb_category,
                         "timePeriod": time_period,
@@ -58,29 +115,21 @@ def fetch_from_leaderboard(lb_category: str, time_period: str, max_pages: int, p
                         "limit": page_size,
                         "offset": offset,
                     },
-                    headers=HEADERS,
                     timeout=12
                 )
-                if resp.status_code == 200:
-                    rows = resp.json()
+                if resp is not None and resp.status_code == 200:
+                    payload = resp.json()
+                    rows = payload.get("data", payload) if isinstance(payload, dict) else payload
                     if not rows:
                         break
                     for r in rows:
-                        w = (r.get("proxyWallet") or "").lower()
-                        if w and w not in profiles:
-                            pnl = float(r.get("pnl", 0))
-                            vol = float(r.get("vol", 0))
-                            if vol > 0:
-                                profiles[w] = {
-                                    "Username": r.get("userName") or f"{w[:6]}...{w[-4:]}",
-                                    "Wallet": w,
-                                    "Profile": f"https://polymarket.com/{w}",
-                                    "PnL ($)": round(pnl, 2),
-                                    "Volume ($)": round(vol, 2),
-                                    "PnL / Volume (%)": round((pnl / vol) * 100, 3),
-                                }
+                        parsed = parse_leaderboard_row(r)
+                        if parsed and parsed["Wallet"] not in profiles:
+                            profiles[parsed["Wallet"]] = parsed
                 else:
-                    errors.append(f"Leaderboard HTTP {resp.status_code}: {resp.text[:120]}")
+                    code = resp.status_code if resp is not None else "No Response"
+                    body = resp.text[:160] if resp is not None else ""
+                    errors.append(f"Leaderboard HTTP {code}: {body}")
                     break
             except Exception as e:
                 errors.append(f"Lỗi kết nối Leaderboard: {e}")
@@ -89,7 +138,7 @@ def fetch_from_leaderboard(lb_category: str, time_period: str, max_pages: int, p
             if progress_bar:
                 progress_bar.progress(
                     min(step / total_steps, 1.0),
-                    text=f"Đang tải Leaderboard ({lb_category} - {order_by}, trang {page + 1}/{max_pages}) — Đã gom {len(profiles)} ví..."
+                    text=f"Đang tải Leaderboard v2 ({lb_category} - {order_by}, trang {page + 1}/{max_pages}) — Đã gom {len(profiles)} ví..."
                 )
             time.sleep(0.08)
 
@@ -117,7 +166,6 @@ def fetch_wallets_from_holders(tag_slug: str | None, sub_keyword: str, market_li
     except Exception as e:
         errors.append(f"Lỗi kết nối Gamma API: {e}")
 
-    # Fallback nếu tag_slug không trả kết quả: tải danh sách event chung và lọc theo tag bên trong
     if not events and tag_slug:
         try:
             fb_resp = requests.get(
@@ -153,20 +201,25 @@ def fetch_wallets_from_holders(tag_slug: str | None, sub_keyword: str, market_li
     for idx, m in enumerate(target_markets):
         cid = m.get("conditionId")
         try:
-            # LƯU Ý: /holders chỉ nhận limit tối đa là 20
-            h_resp = requests.get(
-                f"{DATA_API}/holders",
+            h_resp = request_data_api(
+                "holders",
                 params={"market": cid, "limit": 20},
-                headers=HEADERS,
                 timeout=10
             )
-            if h_resp.status_code == 200:
-                for token_group in h_resp.json():
+            if h_resp is not None and h_resp.status_code == 200:
+                payload = h_resp.json()
+                groups = payload.get("data", payload) if isinstance(payload, dict) else payload
+                for token_group in groups:
                     for holder in token_group.get("holders", []):
-                        w = holder.get("proxyWallet")
+                        w = (
+                            holder.get("proxyWallet")
+                            or holder.get("wallet")
+                            or holder.get("address")
+                            or ""
+                        ).strip().lower()
                         if w:
-                            wallets.add(w.lower())
-            elif not errors:
+                            wallets.add(w)
+            elif not errors and h_resp is not None:
                 errors.append(f"Holders API HTTP {h_resp.status_code}: {h_resp.text[:120]}")
         except Exception as e:
             if not errors:
@@ -183,16 +236,16 @@ def fetch_wallets_from_holders(tag_slug: str | None, sub_keyword: str, market_li
 
 
 def fetch_markets_traded_only(wallet: str) -> int:
-    """Chỉ lấy số lượng Markets Traded cho một ví (dùng khi đã có sẵn PnL/Vol từ Leaderboard)."""
+    """Lấy số lượng Markets Traded cho một ví."""
     try:
-        tr_resp = requests.get(
-            f"{DATA_API}/traded",
-            params={"user": wallet},
-            headers=HEADERS,
-            timeout=10
-        )
-        if tr_resp.status_code == 200:
-            return int(tr_resp.json().get("traded", 0))
+        tr_resp = request_data_api("traded", params={"user": wallet}, timeout=10)
+        if tr_resp is not None and tr_resp.status_code == 200:
+            data = tr_resp.json()
+            if isinstance(data, dict):
+                val = data.get("traded") or data.get("marketsTraded") or data.get("count") or 0
+                return int(val)
+            if isinstance(data, (int, float)):
+                return int(data)
     except Exception:
         pass
     return 0
@@ -202,35 +255,25 @@ def fetch_single_profile(wallet: str, time_period: str = "ALL"):
     """Lấy đầy đủ PnL, Volume và Markets Traded cho 1 địa chỉ ví."""
     wallet = wallet.strip().lower()
     try:
-        lb_resp = requests.get(
-            f"{DATA_API}/v1/leaderboard",
+        lb_resp = request_data_api(
+            "leaderboard",
             params={"user": wallet, "timePeriod": time_period},
-            headers=HEADERS,
             timeout=10
         )
-        lb_data = lb_resp.json() if lb_resp.status_code == 200 else []
-        if not lb_data:
+        if lb_resp is None or lb_resp.status_code != 200:
             return None
 
-        user_stats = lb_data[0]
-        pnl = float(user_stats.get("pnl", 0))
-        vol = float(user_stats.get("vol", 0))
-        username = user_stats.get("userName") or f"{wallet[:6]}...{wallet[-4:]}"
-
-        if vol <= 0:
+        payload = lb_resp.json()
+        rows = payload.get("data", payload) if isinstance(payload, dict) else payload
+        if not rows:
             return None
 
-        markets_traded = fetch_markets_traded_only(wallet)
+        parsed = parse_leaderboard_row(rows[0])
+        if not parsed:
+            return None
 
-        return {
-            "Username": username,
-            "Wallet": wallet,
-            "Profile": f"https://polymarket.com/{wallet}",
-            "PnL ($)": round(pnl, 2),
-            "Volume ($)": round(vol, 2),
-            "PnL / Volume (%)": round((pnl / vol) * 100, 3),
-            "Markets Traded": markets_traded,
-        }
+        parsed["Markets Traded"] = fetch_markets_traded_only(wallet)
+        return parsed
     except Exception:
         return None
 
