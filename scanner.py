@@ -8,6 +8,21 @@ import streamlit as st
 GAMMA_API = "https://gamma-api.polymarket.com"
 DATA_API = "https://data-api.polymarket.com"
 
+# Danh sách Tag chuẩn theo giao diện Polymarket Leaderboard
+POLYMARKET_TAGS = {
+    "All Categories": None,
+    "Politics": "politics",
+    "Sports": "sports",
+    "Esports": "esports",
+    "Crypto": "crypto",
+    "Finance": "finance",
+    "Culture": "culture",
+    "Mentions": "mentions",
+    "Weather": "weather",
+    "Economics": "economics",
+    "Tech": "tech",
+}
+
 st.set_page_config(
     page_title="Polymarket Copy-Wallet Scanner",
     page_icon="🎯",
@@ -15,57 +30,63 @@ st.set_page_config(
 )
 
 # --- HÀM GỌI API POLYMARKET ---
-def fetch_candidate_wallets(keyword: str, market_limit: int, trades_per_market: int, progress_bar=None):
-    """Quét các thị trường đang mở để thu thập danh sách proxyWallet."""
-    markets = []
-    # Lấy tối đa 300 market đang active để đảm bảo không sót ngách (vd: temperature)
-    for offset in [0, 100, 200]:
-        try:
-            resp = requests.get(
-                f"{GAMMA_API}/markets",
-                params={"active": "true", "closed": "false", "limit": 100, "offset": offset},
-                timeout=15
-            )
-            if resp.status_code == 200:
-                batch = resp.json()
-                if not batch:
-                    break
-                markets.extend(batch)
-        except Exception:
-            break
+def fetch_candidate_wallets(tag_slug: str | None, sub_keyword: str, market_limit: int, trades_per_market: int, progress_bar=None):
+    """Lấy danh sách thị trường theo Tag của Polymarket và trích xuất proxyWallet."""
+    params = {
+        "active": "true",
+        "closed": "false",
+        "limit": 100,
+        "order": "volume24hr",
+        "ascending": "false",
+    }
+    if tag_slug:
+        params["tag_slug"] = tag_slug
 
-    if keyword.strip():
-        kw = keyword.strip().lower()
-        markets = [
-            m for m in markets
-            if kw in m.get("question", "").lower() or kw in m.get("slug", "").lower()
-        ]
+    try:
+        resp = requests.get(f"{GAMMA_API}/events", params=params, timeout=15)
+        resp.raise_for_status()
+        events = resp.json()
+    except Exception:
+        return []
+
+    # Gom toàn bộ market (conditionId) nằm trong các event thuộc tag
+    markets = []
+    kw = sub_keyword.strip().lower()
+    for ev in events:
+        ev_title = ev.get("title", "").lower()
+        for m in ev.get("markets", []):
+            if m.get("closed") or not m.get("conditionId"):
+                continue
+            q_text = m.get("question", "").lower()
+            if not kw or kw in q_text or kw in ev_title:
+                markets.append(m)
 
     target_markets = markets[:market_limit]
-    wallets = set()
-
     if not target_markets:
         return []
 
+    wallets = set()
     for idx, m in enumerate(target_markets):
         cid = m.get("conditionId")
-        if cid:
-            try:
-                t_resp = requests.get(
-                    f"{DATA_API}/trades",
-                    params={"market": cid, "limit": trades_per_market},
-                    timeout=12
-                )
-                if t_resp.status_code == 200:
-                    for trade in t_resp.json():
-                        w = trade.get("proxyWallet")
-                        if w:
-                            wallets.add(w.lower())
-            except Exception:
-                pass
+        try:
+            t_resp = requests.get(
+                f"{DATA_API}/trades",
+                params={"market": cid, "limit": trades_per_market},
+                timeout=12
+            )
+            if t_resp.status_code == 200:
+                for trade in t_resp.json():
+                    w = trade.get("proxyWallet")
+                    if w:
+                        wallets.add(w.lower())
+        except Exception:
+            pass
 
         if progress_bar:
-            progress_bar.progress((idx + 1) / len(target_markets), text=f"Đang quét thị trường {idx + 1}/{len(target_markets)} — Đã gom {len(wallets)} ví...")
+            progress_bar.progress(
+                (idx + 1) / len(target_markets),
+                text=f"Đang quét kèo {idx + 1}/{len(target_markets)} — Đã gom {len(wallets)} ví..."
+            )
         time.sleep(0.08)
 
     return list(wallets)
@@ -77,7 +98,7 @@ def fetch_single_profile(wallet: str, time_period: str = "ALL"):
     try:
         lb_resp = requests.get(
             f"{DATA_API}/v1/leaderboard",
-            params={"user": wallet, "timePeriod": time_period},
+            params={"user": wallet, "timePeriod": time_period, "category": "OVERALL"},
             timeout=10
         )
         lb_data = lb_resp.json() if lb_resp.status_code == 200 else []
@@ -113,7 +134,7 @@ def fetch_single_profile(wallet: str, time_period: str = "ALL"):
 
 
 def scan_profiles_concurrent(wallets: list, time_period: str, progress_bar):
-    """Lấy dữ liệu nhiều ví song song với số luồng an toàn để tránh rate-limit."""
+    """Phân tích song song danh sách ví để tối ưu tốc độ."""
     results = []
     total = len(wallets)
     if total == 0:
@@ -151,8 +172,7 @@ with st.sidebar:
             max_value=100.0,
             value=0.15,
             step=0.05,
-            format="%.2f",
-            help="Tỷ lệ lợi nhuận trên tổng khối lượng giao dịch tối thiểu."
+            format="%.2f"
         )
     with col_r2:
         max_ratio = st.number_input(
@@ -161,8 +181,7 @@ with st.sidebar:
             max_value=500.0,
             value=3.50,
             step=0.10,
-            format="%.2f",
-            help="Chặn các ví đánh gamble biến động quá lớn."
+            format="%.2f"
         )
 
     min_pnl = st.number_input(
@@ -195,10 +214,15 @@ with st.sidebar:
 
     st.divider()
     st.subheader("3. Phạm vi quét dữ liệu")
-    keyword_input = st.text_input(
-        "Từ khóa ngách thị trường",
-        value="temperature",
-        placeholder="VD: temperature, bitcoin, nba... (để trống = toàn sàn)"
+    selected_tag_label = st.selectbox(
+        "Category Tag (Polymarket)",
+        options=list(POLYMARKET_TAGS.keys()),
+        index=8  # Mặc định chọn sẵn "Weather"
+    )
+    sub_keyword = st.text_input(
+        "Từ khóa lọc sâu (tùy chọn)",
+        value="",
+        placeholder="Để trống để quét toàn bộ tag đã chọn..."
     )
     time_period = st.selectbox(
         "Khung thời gian tính PnL/Vol",
@@ -211,23 +235,23 @@ with st.sidebar:
 
 # --- GIAO DIỆN CHÍNH ---
 st.title("🎯 Polymarket Copy-Wallet Filter")
-st.caption("Lọc ví theo hiệu suất PnL/Volume và độ dày kinh nghiệm thị trường (loại ví mới & bot HFT).")
+st.caption("Lọc ví theo hiệu suất PnL/Volume và số lượng thị trường đã tham gia theo từng Category Tag.")
 
-tab_scan, tab_single = st.tabs(["🔍 Quét ví trên sàn", "🧪 Kiểm tra nhanh 1 ví"])
+tab_scan, tab_single = st.tabs(["🔍 Quét ví theo Tag", "🧪 Kiểm tra nhanh 1 ví"])
 
-# TAB 1: QUÉT TOÀN SÀN / NGÁCH
 with tab_scan:
     col_btn, col_info = st.columns([1, 3])
     with col_btn:
-        start_scan = st.button("🚀 Bắt đầu quét ví", type="primary", use_container_width=True)
+        start_scan = st.button(f"🚀 Quét tag {selected_tag_label}", type="primary", use_container_width=True)
     with col_info:
         if "raw_df" in st.session_state and not st.session_state["raw_df"].empty:
-            st.info(f"Đang lưu sẵn **{len(st.session_state['raw_df'])}** hồ sơ ví trong bộ nhớ. Bạn có thể kéo chỉnh thông số bên trái để lọc lại ngay lập tức.")
+            st.info(f"Đang lưu sẵn **{len(st.session_state['raw_df'])}** hồ sơ ví trong bộ nhớ. Kéo chỉnh thông số bên trái để lọc lại ngay lập tức.")
 
     if start_scan:
-        progress = st.progress(0.0, text="Đang tìm thị trường phù hợp...")
+        progress = st.progress(0.0, text=f"Đang tải danh sách kèo thuộc tag {selected_tag_label}...")
         wallets = fetch_candidate_wallets(
-            keyword=keyword_input,
+            tag_slug=POLYMARKET_TAGS[selected_tag_label],
+            sub_keyword=sub_keyword,
             market_limit=market_limit,
             trades_per_market=trades_per_market,
             progress_bar=progress
@@ -235,13 +259,12 @@ with tab_scan:
 
         if not wallets:
             progress.empty()
-            st.warning("Không tìm thấy thị trường hoặc giao dịch nào khớp từ khóa. Hãy thử xóa từ khóa hoặc tăng số thị trường quét.")
+            st.warning("Không tìm thấy giao dịch nào trong tag này. Hãy thử xóa từ khóa lọc sâu hoặc chọn tag khác.")
         else:
             raw_df = scan_profiles_concurrent(wallets, time_period=time_period, progress_bar=progress)
             progress.empty()
             st.session_state["raw_df"] = raw_df
 
-    # Áp dụng bộ lọc thời gian thực trên dữ liệu đã quét
     if "raw_df" in st.session_state and not st.session_state["raw_df"].empty:
         df = st.session_state["raw_df"].copy()
 
@@ -253,7 +276,6 @@ with tab_scan:
             (df["Markets Traded"] <= max_markets)
         ].sort_values(by="PnL / Volume (%)", ascending=False)
 
-        # Thống kê tổng quan
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Tổng ví đã quét", len(df))
         m2.metric("Ví đạt chuẩn lọc", len(filtered_df))
@@ -263,7 +285,7 @@ with tab_scan:
         m4.metric("Markets Traded TB", f"{avg_mkts:,}")
 
         if filtered_df.empty:
-            st.warning("Không có ví nào khớp ngưỡng hiện tại. Thử giảm Min PnL/Vol hoặc nới rộng khoảng Markets Traded ở thanh bên trái.")
+            st.warning("Chưa có ví nào khớp ngưỡng hiện tại. Hãy nới rộng khoảng PnL/Vol hoặc Markets Traded ở thanh bên trái.")
         else:
             st.dataframe(
                 filtered_df,
@@ -285,11 +307,10 @@ with tab_scan:
             st.download_button(
                 label="📥 Tải danh sách ví đạt chuẩn (.CSV)",
                 data=csv_bytes,
-                file_name="polymarket_copy_wallets.csv",
+                file_name=f"polymarket_{selected_tag_label.lower().replace(' ', '_')}_wallets.csv",
                 mime="text/csv"
             )
 
-# TAB 2: KIỂM TRA 1 VÍ CỤ THỂ
 with tab_single:
     st.write("Dán địa chỉ ví (`0x...`) bất kỳ để kiểm tra xem ví đó có vượt qua bộ lọc hiện tại không:")
     wallet_input = st.text_input("Địa chỉ Proxy Wallet", placeholder="0x1234abcd...")
