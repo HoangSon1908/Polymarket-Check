@@ -1,4 +1,3 @@
-import json
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -210,7 +209,7 @@ def fetch_from_leaderboard(lb_category: str, time_period: str, max_pages: int, p
 
 
 def fetch_wallets_from_holders(tag_slug: str | None, sub_keyword: str, market_limit: int, progress_bar=None):
-    """Lấy danh sách ví đang nắm giữ vị thế (/holders, limit=20) tại các kèo đang mở."""
+    """Lấy danh sách ví đang nắm giữ vị thế (/v2/holders với tham số 'condition') tại các kèo đang mở."""
     errors = []
     params = {
         "active": "true",
@@ -265,9 +264,10 @@ def fetch_wallets_from_holders(tag_slug: str | None, sub_keyword: str, market_li
     for idx, m in enumerate(target_markets):
         cid = m.get("conditionId")
         try:
+            # SỬA LỖI: API /v2/holders dùng 'condition' thay vì 'market'
             h_resp = request_data_api(
                 "holders",
-                params={"market": cid, "limit": 20},
+                params={"condition": cid, "limit": 20},
                 timeout=10
             )
             if h_resp is not None and h_resp.status_code == 200:
@@ -289,7 +289,7 @@ def fetch_wallets_from_holders(tag_slug: str | None, sub_keyword: str, market_li
                         if w:
                             wallets.add(w)
             elif not errors and h_resp is not None:
-                errors.append(f"Holders API HTTP {h_resp.status_code}: {h_resp.text[:120]}")
+                errors.append(f"Holders API HTTP {h_resp.status_code}: {h_resp.text[:140]}")
         except Exception as e:
             if not errors:
                 errors.append(f"Lỗi Holders API: {e}")
@@ -304,50 +304,64 @@ def fetch_wallets_from_holders(tag_slug: str | None, sub_keyword: str, market_li
     return list(wallets), errors
 
 
-def fetch_markets_traded_only(wallet: str, use_positions_fallback: bool = False) -> int:
-    """Lấy số lượng Markets Traded cho một ví (hỗ trợ cả /v2/traded lẫn fallback đếm vị thế)."""
-    if not use_positions_fallback:
-        for url in [f"{DATA_API}/v2/traded", f"{DATA_API}/v2/users/{wallet}/traded"]:
-            try:
-                tr_resp = requests.get(url, params={"user": wallet}, headers=HEADERS, timeout=10)
-                if tr_resp.status_code == 200:
-                    data = tr_resp.json()
-                    if isinstance(data, (int, float)):
-                        return int(data)
-                    if isinstance(data, dict):
-                        for k in ("traded", "markets_traded", "marketsTraded", "count", "total"):
-                            if data.get(k) is not None:
-                                return int(data[k])
-                        for v in data.values():
-                            if isinstance(v, (int, float)):
-                                return int(v)
-            except Exception:
-                pass
+def fetch_markets_traded_only(wallet: str) -> int:
+    """Lấy số lượng Markets Traded chuẩn xác qua /traded, Gamma profile hoặc đếm vị thế v2 (limit=100)."""
+    # 1. Thử endpoint đếm trực tiếp của Data API & Gamma API
+    direct_checks = [
+        (f"{DATA_API}/traded", {"user": wallet}),
+        (f"{DATA_API}/v2/traded", {"user": wallet}),
+        (f"{DATA_API}/v2/traded", {"address": wallet}),
+        (f"{GAMMA_API}/public-profile", {"address": wallet}),
+    ]
+    for url, params in direct_checks:
+        try:
+            resp = requests.get(url, params=params, headers=HEADERS, timeout=8)
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, (int, float)) and int(data) > 0:
+                    return int(data)
+                if isinstance(data, dict):
+                    for k in ("traded", "markets_traded", "marketsTraded", "marketsCount", "count"):
+                        val = data.get(k)
+                        if val is not None and int(val) > 0:
+                            return int(val)
+        except Exception:
+            pass
 
-    # Fallback: đếm unique condition_id từ closed-positions + positions
+    # 2. Fallback: đếm unique condition_id từ closed-positions + positions với limit=100 chuẩn v2
     unique_markets = set()
     for ep in ("closed-positions", "positions"):
-        cursor = None
-        for _ in range(4):
-            params = {"user": wallet, "limit": 500}
-            if cursor:
-                params["cursor"] = cursor
-            try:
-                resp = requests.get(f"{DATA_API}/v2/{ep}", params=params, headers=HEADERS, timeout=10)
-                if resp.status_code != 200:
+        for user_param in ("user", "address"):
+            cursor = None
+            got_data = False
+            for _ in range(25):  # Tối đa 2,500 vị thế mỗi loại
+                params = {user_param: wallet, "limit": 100}
+                if cursor:
+                    params["cursor"] = cursor
+                try:
+                    resp = request_data_api(ep, params=params, timeout=10)
+                    if resp is None or resp.status_code != 200:
+                        break
+                    rows, next_cursor = extract_rows_and_cursor(resp.json())
+                    if not rows:
+                        break
+                    got_data = True
+                    for r in rows:
+                        if isinstance(r, dict):
+                            cid = (
+                                r.get("condition_id")
+                                or r.get("conditionId")
+                                or r.get("market")
+                                or r.get("asset")
+                            )
+                            if cid:
+                                unique_markets.add(str(cid))
+                    if not next_cursor:
+                        break
+                    cursor = next_cursor
+                except Exception:
                     break
-                rows, next_cursor = extract_rows_and_cursor(resp.json())
-                if not rows:
-                    break
-                for r in rows:
-                    if isinstance(r, dict):
-                        cid = r.get("condition_id") or r.get("conditionId") or r.get("market") or r.get("asset")
-                        if cid:
-                            unique_markets.add(str(cid))
-                if not next_cursor:
-                    break
-                cursor = next_cursor
-            except Exception:
+            if got_data:
                 break
 
     return len(unique_markets)
@@ -373,11 +387,8 @@ def fetch_single_profile(wallet: str, time_period: str = "ALL"):
         if not parsed:
             return None
 
-        if parsed["Markets Traded"] is None:
-            mkts = fetch_markets_traded_only(wallet, use_positions_fallback=False)
-            if mkts == 0:
-                mkts = fetch_markets_traded_only(wallet, use_positions_fallback=True)
-            parsed["Markets Traded"] = mkts
+        if not parsed["Markets Traded"]:
+            parsed["Markets Traded"] = fetch_markets_traded_only(wallet)
 
         return parsed
     except Exception:
@@ -386,20 +397,15 @@ def fetch_single_profile(wallet: str, time_period: str = "ALL"):
 
 def enrich_leaderboard_profiles(profiles_dict: dict, progress_bar):
     """Bổ sung cột Markets Traded song song cho danh sách ví lấy từ Leaderboard."""
-    wallets_need_mkts = [w for w, p in profiles_dict.items() if p.get("Markets Traded") is None]
+    wallets_need_mkts = [w for w, p in profiles_dict.items() if not p.get("Markets Traded")]
     total = len(wallets_need_mkts)
     if total == 0:
         return pd.DataFrame(list(profiles_dict.values()))
 
-    # Kiểm tra trước trên ví đầu tiên xem /v2/traded có hoạt động không
-    sample_w = wallets_need_mkts[0]
-    test_val = fetch_markets_traded_only(sample_w, use_positions_fallback=False)
-    use_fallback = (test_val == 0)
-
     completed = 0
     with ThreadPoolExecutor(max_workers=8) as executor:
         future_to_wallet = {
-            executor.submit(fetch_markets_traded_only, w, use_fallback): w for w in wallets_need_mkts
+            executor.submit(fetch_markets_traded_only, w): w for w in wallets_need_mkts
         }
         for future in as_completed(future_to_wallet):
             w = future_to_wallet[future]
@@ -408,7 +414,7 @@ def enrich_leaderboard_profiles(profiles_dict: dict, progress_bar):
             if completed % 10 == 0 or completed == total:
                 progress_bar.progress(
                     completed / total,
-                    text=f"Đang kiểm tra số thị trường đã đánh: {completed}/{total} ví..."
+                    text=f"Đang đếm số thị trường đã đánh: {completed}/{total} ví..."
                 )
 
     return pd.DataFrame(list(profiles_dict.values()))
@@ -581,6 +587,15 @@ with tab_scan:
     if "raw_df" in st.session_state and not st.session_state["raw_df"].empty:
         df = st.session_state["raw_df"].copy()
 
+        # Nếu dữ liệu cũ trong session_state chưa có Markets Traded (>0), cho phép cập nhật nhanh
+        if df["Markets Traded"].fillna(0).max() == 0:
+            if st.button("🔄 Tính lại cột Markets Traded cho danh sách ví đang lưu"):
+                prog = st.progress(0.0, text="Đang đếm lại số thị trường đã đánh...")
+                records = {row["Wallet"]: {**row, "Markets Traded": 0} for _, row in df.iterrows()}
+                st.session_state["raw_df"] = enrich_leaderboard_profiles(records, progress_bar=prog)
+                prog.empty()
+                st.rerun()
+
         cond_pnl = df["PnL ($)"] >= min_pnl
         cond_ratio = (df["PnL / Volume (%)"] >= min_ratio) & (df["PnL / Volume (%)"] <= max_ratio)
         cond_mkts = (df["Markets Traded"] >= min_markets) & (df["Markets Traded"] <= max_markets)
@@ -595,7 +610,6 @@ with tab_scan:
         avg_mkts = int(filtered_df["Markets Traded"].mean()) if not filtered_df.empty else 0
         m4.metric("Markets Traded TB", f"{avg_mkts:,}")
 
-        # Chẩn đoán nhanh xem tiêu chí nào đang loại bớt nhiều ví nhất
         st.caption(
             f"📊 Chi tiết từng điều kiện trên {len(df)} ví: "
             f"**{int(cond_pnl.sum())}** ví đạt PnL ≥ ${min_pnl:g} | "
