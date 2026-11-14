@@ -73,7 +73,7 @@ def extract_rows_and_cursor(payload):
 
 
 def parse_leaderboard_row(row: dict):
-    """Trích xuất linh hoạt dữ liệu trader từ phản hồi Leaderboard v2 (snake_case & camelCase)."""
+    """Trích xuất linh hoạt dữ liệu trader từ phản hồi Leaderboard v2."""
     if not isinstance(row, dict):
         return None
 
@@ -122,6 +122,15 @@ def parse_leaderboard_row(row: dict):
     if vol <= 0:
         return None
 
+    raw_mkts = None
+    for k in ("markets_traded", "marketsTraded", "traded", "num_markets", "markets"):
+        if row.get(k) is not None:
+            try:
+                raw_mkts = int(row.get(k))
+            except (ValueError, TypeError):
+                raw_mkts = None
+            break
+
     username = (
         row.get("user_name")
         or row.get("userName")
@@ -139,6 +148,7 @@ def parse_leaderboard_row(row: dict):
         "PnL ($)": round(pnl, 2),
         "Volume ($)": round(vol, 2),
         "PnL / Volume (%)": round((pnl / vol) * 100, 3),
+        "Markets Traded": raw_mkts,
     }
 
 
@@ -147,7 +157,6 @@ def fetch_from_leaderboard(lb_category: str, time_period: str, max_pages: int, p
     """Lấy danh sách trader + PnL + Volume từ /v2/leaderboard bằng cursor pagination."""
     profiles = {}
     errors = []
-    sample_payload = None
     page_size = 50
     sort_modes = ["PNL", "VOLUME"]
     total_steps = max_pages * len(sort_modes)
@@ -169,11 +178,7 @@ def fetch_from_leaderboard(lb_category: str, time_period: str, max_pages: int, p
             try:
                 resp = request_data_api("leaderboard", params=req_params, timeout=12)
                 if resp is not None and resp.status_code == 200:
-                    payload = resp.json()
-                    if sample_payload is None:
-                        sample_payload = payload
-
-                    rows, next_cursor = extract_rows_and_cursor(payload)
+                    rows, next_cursor = extract_rows_and_cursor(resp.json())
                     if not rows:
                         break
 
@@ -201,7 +206,7 @@ def fetch_from_leaderboard(lb_category: str, time_period: str, max_pages: int, p
                 )
             time.sleep(0.08)
 
-    return profiles, errors, sample_payload
+    return profiles, errors
 
 
 def fetch_wallets_from_holders(tag_slug: str | None, sub_keyword: str, market_limit: int, progress_bar=None):
@@ -299,24 +304,53 @@ def fetch_wallets_from_holders(tag_slug: str | None, sub_keyword: str, market_li
     return list(wallets), errors
 
 
-def fetch_markets_traded_only(wallet: str) -> int:
-    """Lấy số lượng Markets Traded cho một ví."""
-    try:
-        tr_resp = request_data_api("traded", params={"user": wallet}, timeout=10)
-        if tr_resp is not None and tr_resp.status_code == 200:
-            data = tr_resp.json()
-            if isinstance(data, (int, float)):
-                return int(data)
-            if isinstance(data, dict):
-                for k in ("traded", "markets_traded", "marketsTraded", "count", "total"):
-                    if data.get(k) is not None:
-                        return int(data[k])
-                for v in data.values():
-                    if isinstance(v, (int, float)):
-                        return int(v)
-    except Exception:
-        pass
-    return 0
+def fetch_markets_traded_only(wallet: str, use_positions_fallback: bool = False) -> int:
+    """Lấy số lượng Markets Traded cho một ví (hỗ trợ cả /v2/traded lẫn fallback đếm vị thế)."""
+    if not use_positions_fallback:
+        for url in [f"{DATA_API}/v2/traded", f"{DATA_API}/v2/users/{wallet}/traded"]:
+            try:
+                tr_resp = requests.get(url, params={"user": wallet}, headers=HEADERS, timeout=10)
+                if tr_resp.status_code == 200:
+                    data = tr_resp.json()
+                    if isinstance(data, (int, float)):
+                        return int(data)
+                    if isinstance(data, dict):
+                        for k in ("traded", "markets_traded", "marketsTraded", "count", "total"):
+                            if data.get(k) is not None:
+                                return int(data[k])
+                        for v in data.values():
+                            if isinstance(v, (int, float)):
+                                return int(v)
+            except Exception:
+                pass
+
+    # Fallback: đếm unique condition_id từ closed-positions + positions
+    unique_markets = set()
+    for ep in ("closed-positions", "positions"):
+        cursor = None
+        for _ in range(4):
+            params = {"user": wallet, "limit": 500}
+            if cursor:
+                params["cursor"] = cursor
+            try:
+                resp = requests.get(f"{DATA_API}/v2/{ep}", params=params, headers=HEADERS, timeout=10)
+                if resp.status_code != 200:
+                    break
+                rows, next_cursor = extract_rows_and_cursor(resp.json())
+                if not rows:
+                    break
+                for r in rows:
+                    if isinstance(r, dict):
+                        cid = r.get("condition_id") or r.get("conditionId") or r.get("market") or r.get("asset")
+                        if cid:
+                            unique_markets.add(str(cid))
+                if not next_cursor:
+                    break
+                cursor = next_cursor
+            except Exception:
+                break
+
+    return len(unique_markets)
 
 
 def fetch_single_profile(wallet: str, time_period: str = "ALL"):
@@ -339,7 +373,12 @@ def fetch_single_profile(wallet: str, time_period: str = "ALL"):
         if not parsed:
             return None
 
-        parsed["Markets Traded"] = fetch_markets_traded_only(wallet)
+        if parsed["Markets Traded"] is None:
+            mkts = fetch_markets_traded_only(wallet, use_positions_fallback=False)
+            if mkts == 0:
+                mkts = fetch_markets_traded_only(wallet, use_positions_fallback=True)
+            parsed["Markets Traded"] = mkts
+
         return parsed
     except Exception:
         return None
@@ -347,15 +386,20 @@ def fetch_single_profile(wallet: str, time_period: str = "ALL"):
 
 def enrich_leaderboard_profiles(profiles_dict: dict, progress_bar):
     """Bổ sung cột Markets Traded song song cho danh sách ví lấy từ Leaderboard."""
-    wallets = list(profiles_dict.keys())
-    total = len(wallets)
+    wallets_need_mkts = [w for w, p in profiles_dict.items() if p.get("Markets Traded") is None]
+    total = len(wallets_need_mkts)
     if total == 0:
-        return pd.DataFrame()
+        return pd.DataFrame(list(profiles_dict.values()))
+
+    # Kiểm tra trước trên ví đầu tiên xem /v2/traded có hoạt động không
+    sample_w = wallets_need_mkts[0]
+    test_val = fetch_markets_traded_only(sample_w, use_positions_fallback=False)
+    use_fallback = (test_val == 0)
 
     completed = 0
     with ThreadPoolExecutor(max_workers=8) as executor:
         future_to_wallet = {
-            executor.submit(fetch_markets_traded_only, w): w for w in wallets
+            executor.submit(fetch_markets_traded_only, w, use_fallback): w for w in wallets_need_mkts
         }
         for future in as_completed(future_to_wallet):
             w = future_to_wallet[future]
@@ -435,7 +479,7 @@ with st.sidebar:
     with col_m1:
         min_markets = st.number_input(
             "Min Markets (Chống ví mới)",
-            min_value=1,
+            min_value=0,
             max_value=50000,
             value=200,
             step=50
@@ -453,14 +497,14 @@ with st.sidebar:
     st.subheader("3. Phạm vi quét dữ liệu")
     scan_source = st.radio(
         "Nguồn thu thập ví",
-        options=["Bảng xếp hạng (Leaderboard)", "Kèo đang mở (Holders)"],
+        options=["Kèo đang mở (Holders)", "Bảng xếp hạng (Leaderboard)"],
         index=0,
-        help="Leaderboard lấy trực tiếp trader theo Tag; Kèo đang mở quét các ví đang giữ lệnh ở kèo active."
+        help="Kèo đang mở giúp tìm các ví tầm trung theo đúng ngách; Leaderboard lấy top trader toàn sàn."
     )
     selected_tag_label = st.selectbox(
         "Category Tag (Polymarket)",
         options=list(POLYMARKET_TAGS.keys()),
-        index=0
+        index=8  # Mặc định Weather
     )
     sub_keyword = st.text_input(
         "Từ khóa lọc sâu (dùng cho Kèo đang mở)",
@@ -473,10 +517,10 @@ with st.sidebar:
         index=0
     )
     scan_depth = st.slider(
-        "Độ sâu quét (Số trang Leaderboard / Số kèo)",
+        "Độ sâu quét (Số kèo / Số trang Leaderboard)",
         min_value=2,
         max_value=40,
-        value=6,
+        value=8,
         step=2
     )
 
@@ -499,10 +543,9 @@ with tab_scan:
         tag_info = POLYMARKET_TAGS[selected_tag_label]
         progress = st.progress(0.0, text=f"Đang khởi tạo quét tag {selected_tag_label}...")
         api_errors = []
-        sample_payload = None
 
         if scan_source == "Bảng xếp hạng (Leaderboard)":
-            profiles_dict, api_errors, sample_payload = fetch_from_leaderboard(
+            profiles_dict, api_errors = fetch_from_leaderboard(
                 lb_category=tag_info["lb_cat"],
                 time_period=time_period,
                 max_pages=scan_depth,
@@ -531,23 +574,18 @@ with tab_scan:
                 st.error(err)
 
         if raw_df.empty:
-            st.warning("Không thu thập được dữ liệu ví nào trong đợt quét này. Bạn hãy thử đổi sang nguồn quét còn lại hoặc chọn Tag khác.")
-            if sample_payload is not None:
-                with st.expander("🔍 Xem cấu trúc dữ liệu thô API trả về"):
-                    st.code(json.dumps(sample_payload, indent=2)[:1500], language="json")
+            st.warning("Không thu thập được dữ liệu ví nào trong đợt quét này. Hãy thử đổi nguồn quét hoặc chọn Tag khác.")
         else:
             st.session_state["raw_df"] = raw_df
 
     if "raw_df" in st.session_state and not st.session_state["raw_df"].empty:
         df = st.session_state["raw_df"].copy()
 
-        filtered_df = df[
-            (df["PnL ($)"] >= min_pnl) &
-            (df["PnL / Volume (%)"] >= min_ratio) &
-            (df["PnL / Volume (%)"] <= max_ratio) &
-            (df["Markets Traded"] >= min_markets) &
-            (df["Markets Traded"] <= max_markets)
-        ].sort_values(by="PnL / Volume (%)", ascending=False)
+        cond_pnl = df["PnL ($)"] >= min_pnl
+        cond_ratio = (df["PnL / Volume (%)"] >= min_ratio) & (df["PnL / Volume (%)"] <= max_ratio)
+        cond_mkts = (df["Markets Traded"] >= min_markets) & (df["Markets Traded"] <= max_markets)
+
+        filtered_df = df[cond_pnl & cond_ratio & cond_mkts].sort_values(by="PnL / Volume (%)", ascending=False)
 
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Tổng ví đã quét", len(df))
@@ -557,23 +595,34 @@ with tab_scan:
         avg_mkts = int(filtered_df["Markets Traded"].mean()) if not filtered_df.empty else 0
         m4.metric("Markets Traded TB", f"{avg_mkts:,}")
 
+        # Chẩn đoán nhanh xem tiêu chí nào đang loại bớt nhiều ví nhất
+        st.caption(
+            f"📊 Chi tiết từng điều kiện trên {len(df)} ví: "
+            f"**{int(cond_pnl.sum())}** ví đạt PnL ≥ ${min_pnl:g} | "
+            f"**{int(cond_ratio.sum())}** ví đạt PnL/Vol [{min_ratio}% – {max_ratio}%] | "
+            f"**{int(cond_mkts.sum())}** ví đạt Markets [{min_markets:,} – {max_markets:,}]"
+        )
+
+        col_config = {
+            "Profile": st.column_config.LinkColumn(
+                "Polymarket Profile",
+                display_text="Mở hồ sơ ↗"
+            ),
+            "PnL ($)": st.column_config.NumberColumn(format="$%.2f"),
+            "Volume ($)": st.column_config.NumberColumn(format="$%.2f"),
+            "PnL / Volume (%)": st.column_config.NumberColumn(format="%.3f%%"),
+            "Markets Traded": st.column_config.NumberColumn(format="%d"),
+        }
+
         if filtered_df.empty:
-            st.warning("Đã tải xong dữ liệu ví nhưng chưa có ví nào khớp ngưỡng lọc hiện tại. Hãy nới rộng khoảng PnL/Vol hoặc Markets Traded ở thanh bên trái.")
+            st.warning("Chưa có ví nào khớp đồng thời cả 3 điều kiện. Xem bảng dữ liệu thô bên dưới để điều chỉnh ngưỡng phù hợp.")
         else:
+            st.subheader(f"✅ Danh sách ví đạt chuẩn ({len(filtered_df)})")
             st.dataframe(
                 filtered_df,
                 use_container_width=True,
                 hide_index=True,
-                column_config={
-                    "Profile": st.column_config.LinkColumn(
-                        "Polymarket Profile",
-                        display_text="Mở hồ sơ ↗"
-                    ),
-                    "PnL ($)": st.column_config.NumberColumn(format="$%.2f"),
-                    "Volume ($)": st.column_config.NumberColumn(format="$%.2f"),
-                    "PnL / Volume (%)": st.column_config.NumberColumn(format="%.3f%%"),
-                    "Markets Traded": st.column_config.NumberColumn(format="%d"),
-                }
+                column_config=col_config
             )
 
             csv_bytes = filtered_df.to_csv(index=False).encode("utf-8-sig")
@@ -582,6 +631,14 @@ with tab_scan:
                 data=csv_bytes,
                 file_name=f"polymarket_{selected_tag_label.lower().replace(' ', '_')}_wallets.csv",
                 mime="text/csv"
+            )
+
+        with st.expander(f"📋 Xem toàn bộ {len(df)} ví đã quét (trước khi lọc)", expanded=filtered_df.empty):
+            st.dataframe(
+                df.sort_values(by="PnL ($)", ascending=False),
+                use_container_width=True,
+                hide_index=True,
+                column_config=col_config
             )
 
 with tab_single:
