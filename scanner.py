@@ -34,7 +34,7 @@ st.set_page_config(
 )
 
 
-# --- HÀM HỖ TRỢ GỌI DATA API V2 (CÓ FALLBACK) ---
+# --- HÀM HỖ TRỢ GỌI DATA API V2 ---
 def request_data_api(path: str, params: dict, timeout: int = 12):
     """Ưu tiên gọi Data API /v2/, tự động thử đường dẫn gốc nếu endpoint chưa chuyển sang v2."""
     clean_path = path.lstrip("/")
@@ -93,7 +93,7 @@ def parse_leaderboard_row(row: dict) -> dict | None:
 
 # --- HÀM LẤY DỮ LIỆU TỪ API POLYMARKET ---
 def fetch_from_leaderboard(lb_category: str, time_period: str, max_pages: int, progress_bar=None):
-    """Lấy trực tiếp danh sách trader + PnL + Volume từ /v2/leaderboard."""
+    """Lấy danh sách trader + PnL + Volume từ /v2/leaderboard bằng cursor pagination."""
     profiles = {}
     errors = []
     page_size = 50
@@ -102,33 +102,52 @@ def fetch_from_leaderboard(lb_category: str, time_period: str, max_pages: int, p
     step = 0
 
     for order_by in sort_modes:
+        cursor = None
         for page in range(max_pages):
             step += 1
-            offset = page * page_size
+            req_params = {
+                "category": lb_category,
+                "timePeriod": time_period,
+                "orderBy": order_by,
+                "limit": page_size,
+            }
+            if cursor:
+                req_params["cursor"] = cursor
+
             try:
-                resp = request_data_api(
-                    "leaderboard",
-                    params={
-                        "category": lb_category,
-                        "timePeriod": time_period,
-                        "orderBy": order_by,
-                        "limit": page_size,
-                        "offset": offset,
-                    },
-                    timeout=12
-                )
+                resp = request_data_api("leaderboard", params=req_params, timeout=12)
                 if resp is not None and resp.status_code == 200:
                     payload = resp.json()
-                    rows = payload.get("data", payload) if isinstance(payload, dict) else payload
+                    if isinstance(payload, dict):
+                        rows = (
+                            payload.get("data")
+                            or payload.get("results")
+                            or payload.get("leaderboard")
+                            or []
+                        )
+                        next_cursor = (
+                            payload.get("next_cursor")
+                            or payload.get("nextCursor")
+                            or (payload.get("pagination") or {}).get("next_cursor")
+                        )
+                    else:
+                        rows = payload if isinstance(payload, list) else []
+                        next_cursor = None
+
                     if not rows:
                         break
+
                     for r in rows:
                         parsed = parse_leaderboard_row(r)
                         if parsed and parsed["Wallet"] not in profiles:
                             profiles[parsed["Wallet"]] = parsed
+
+                    if not next_cursor:
+                        break
+                    cursor = next_cursor
                 else:
                     code = resp.status_code if resp is not None else "No Response"
-                    body = resp.text[:160] if resp is not None else ""
+                    body = resp.text[:180] if resp is not None else ""
                     errors.append(f"Leaderboard HTTP {code}: {body}")
                     break
             except Exception as e:
@@ -264,7 +283,11 @@ def fetch_single_profile(wallet: str, time_period: str = "ALL"):
             return None
 
         payload = lb_resp.json()
-        rows = payload.get("data", payload) if isinstance(payload, dict) else payload
+        rows = (
+            payload.get("data") or payload.get("results") or payload.get("leaderboard") or []
+            if isinstance(payload, dict)
+            else payload
+        )
         if not rows:
             return None
 
