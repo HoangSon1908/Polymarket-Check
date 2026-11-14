@@ -13,19 +13,19 @@ HEADERS = {
     "Accept": "application/json",
 }
 
-# Danh sách Tag chuẩn theo giao diện Polymarket Leaderboard
+# Ánh xạ Tag sang slug của Gamma API và category của Leaderboard API
 POLYMARKET_TAGS = {
-    "All Categories": None,
-    "Politics": "politics",
-    "Sports": "sports",
-    "Esports": "esports",
-    "Crypto": "crypto",
-    "Finance": "finance",
-    "Culture": "culture",
-    "Mentions": "mentions",
-    "Weather": "weather",
-    "Economics": "economics",
-    "Tech": "tech",
+    "All Categories": {"slug": None, "lb_cat": "OVERALL"},
+    "Politics": {"slug": "politics", "lb_cat": "POLITICS"},
+    "Sports": {"slug": "sports", "lb_cat": "SPORTS"},
+    "Esports": {"slug": "esports", "lb_cat": "ESPORTS"},
+    "Crypto": {"slug": "crypto", "lb_cat": "CRYPTO"},
+    "Finance": {"slug": "finance", "lb_cat": "FINANCE"},
+    "Culture": {"slug": "culture", "lb_cat": "CULTURE"},
+    "Mentions": {"slug": "mentions", "lb_cat": "MENTIONS"},
+    "Weather": {"slug": "weather", "lb_cat": "WEATHER"},
+    "Economics": {"slug": "economics", "lb_cat": "ECONOMICS"},
+    "Tech": {"slug": "tech", "lb_cat": "TECH"},
 }
 
 st.set_page_config(
@@ -35,50 +35,56 @@ st.set_page_config(
 )
 
 # --- HÀM GỌI API POLYMARKET ---
-def fetch_candidate_wallets(tag_slug: str | None, sub_keyword: str, market_limit: int, trades_per_market: int, progress_bar=None):
-    """Lấy danh sách ví ứng viên từ giao dịch thực tế theo Tag hoặc toàn sàn."""
+def fetch_wallets_from_leaderboard(lb_category: str, time_period: str, max_users: int, progress_bar=None):
+    """Lấy danh sách ví trực tiếp từ /v1/leaderboard theo Category (không cần qua /trades)."""
     wallets = set()
-    kw = sub_keyword.strip().lower()
+    page_size = 50
+    offsets = list(range(0, max_users, page_size))
 
-    # Trường hợp 1: Quét toàn sàn (All Categories) và không lọc từ khóa -> gọi thẳng /trades cực nhanh
-    if tag_slug is None and not kw:
-        total_trades_to_fetch = min(market_limit * trades_per_market, 3000)
-        batch_size = 500
-        offsets = list(range(0, total_trades_to_fetch, batch_size))
+    # Quét theo cả PNL và VOL để không bỏ sót các ví đánh volume lớn nhưng biên lãi mỏng
+    sort_modes = ["PNL", "VOL"]
+    total_steps = len(offsets) * len(sort_modes)
+    step = 0
 
-        for idx, offset in enumerate(offsets):
+    for order_by in sort_modes:
+        for offset in offsets:
+            step += 1
             try:
-                t_resp = requests.get(
-                    f"{DATA_API}/trades",
-                    params={"limit": batch_size, "offset": offset},
+                resp = requests.get(
+                    f"{DATA_API}/v1/leaderboard",
+                    params={
+                        "category": lb_category,
+                        "timePeriod": time_period,
+                        "orderBy": order_by,
+                        "limit": page_size,
+                        "offset": offset,
+                    },
                     headers=HEADERS,
-                    timeout=15
+                    timeout=12
                 )
-                if t_resp.status_code == 200:
-                    trades = t_resp.json()
-                    if not trades:
+                if resp.status_code == 200:
+                    rows = resp.json()
+                    if not rows:
                         break
-                    for trade in trades:
-                        w = trade.get("proxyWallet")
+                    for r in rows:
+                        w = r.get("proxyWallet")
                         if w:
                             wallets.add(w.lower())
-                else:
-                    st.error(f"Lỗi API Data (/trades): HTTP {t_resp.status_code}")
-                    break
-            except Exception as e:
-                st.error(f"Lỗi kết nối API: {e}")
-                break
+            except Exception:
+                pass
 
             if progress_bar:
                 progress_bar.progress(
-                    (idx + 1) / len(offsets),
-                    text=f"Đang quét giao dịch toàn sàn ({min((idx + 1) * batch_size, total_trades_to_fetch)} lệnh) — Đã gom {len(wallets)} ví..."
+                    min(step / total_steps, 1.0),
+                    text=f"Đang lấy từ Leaderboard ({lb_category} - {order_by}) — Đã gom {len(wallets)} ví..."
                 )
-            time.sleep(0.1)
+            time.sleep(0.08)
 
-        return list(wallets)
+    return list(wallets)
 
-    # Trường hợp 2: Quét theo Tag cụ thể hoặc có từ khóa lọc sâu
+
+def fetch_wallets_from_active_markets(tag_slug: str | None, sub_keyword: str, market_limit: int, progress_bar=None):
+    """Lấy ví từ người giữ vị thế (/holders) và lịch sử hoạt động (/activity) của các kèo đang mở."""
     params = {
         "active": "true",
         "closed": "false",
@@ -87,17 +93,16 @@ def fetch_candidate_wallets(tag_slug: str | None, sub_keyword: str, market_limit
     if tag_slug:
         params["tag_slug"] = tag_slug
 
+    events = []
     try:
         resp = requests.get(f"{GAMMA_API}/events", params=params, headers=HEADERS, timeout=15)
-        if resp.status_code != 200:
-            st.error(f"Lỗi API Gamma (/events): HTTP {resp.status_code}")
-            return []
-        events = resp.json()
+        if resp.status_code == 200:
+            events = resp.json()
     except Exception as e:
-        st.error(f"Không thể kết nối Gamma API: {e}")
+        st.error(f"Lỗi kết nối Gamma API: {e}")
         return []
 
-    # Fallback nếu tag_slug không trả về event nào: tải danh sách chung rồi lọc theo object tags bên trong
+    # Fallback nếu tag_slug không khớp trực tiếp: tải danh sách chung rồi lọc theo object tags
     if not events and tag_slug:
         try:
             fb_resp = requests.get(
@@ -107,14 +112,14 @@ def fetch_candidate_wallets(tag_slug: str | None, sub_keyword: str, market_limit
                 timeout=15
             )
             if fb_resp.status_code == 200:
-                all_events = fb_resp.json()
                 events = [
-                    ev for ev in all_events
+                    ev for ev in fb_resp.json()
                     if any(tag_slug in (t.get("slug", "").lower(), t.get("label", "").lower()) for t in ev.get("tags", []))
                 ]
         except Exception:
             pass
 
+    kw = sub_keyword.strip().lower()
     markets = []
     for ev in events:
         ev_title = ev.get("title", "").lower()
@@ -129,18 +134,38 @@ def fetch_candidate_wallets(tag_slug: str | None, sub_keyword: str, market_limit
     if not target_markets:
         return []
 
+    wallets = set()
     for idx, m in enumerate(target_markets):
         cid = m.get("conditionId")
+
+        # 1. Lấy từ /holders (các ví đang ôm cổ phần trong kèo này)
         try:
-            t_resp = requests.get(
-                f"{DATA_API}/trades",
-                params={"market": cid, "limit": trades_per_market},
+            h_resp = requests.get(
+                f"{DATA_API}/holders",
+                params={"market": cid, "limit": 50},
                 headers=HEADERS,
-                timeout=12
+                timeout=10
             )
-            if t_resp.status_code == 200:
-                for trade in t_resp.json():
-                    w = trade.get("proxyWallet")
+            if h_resp.status_code == 200:
+                for token_group in h_resp.json():
+                    for holder in token_group.get("holders", []):
+                        w = holder.get("proxyWallet")
+                        if w:
+                            wallets.add(w.lower())
+        except Exception:
+            pass
+
+        # 2. Lấy thêm từ /activity (thay thế cho /trades đã bị 410)
+        try:
+            a_resp = requests.get(
+                f"{DATA_API}/activity",
+                params={"market": cid, "type": "TRADE", "limit": 100},
+                headers=HEADERS,
+                timeout=10
+            )
+            if a_resp.status_code == 200:
+                for act in a_resp.json():
+                    w = act.get("proxyWallet")
                     if w:
                         wallets.add(w.lower())
         except Exception:
@@ -207,7 +232,7 @@ def scan_profiles_concurrent(wallets: list, time_period: str, progress_bar):
         return pd.DataFrame()
 
     completed = 0
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    with ThreadPoolExecutor(max_workers=6) as executor:
         future_to_wallet = {
             executor.submit(fetch_single_profile, w, time_period): w for w in wallets
         }
@@ -280,6 +305,12 @@ with st.sidebar:
 
     st.divider()
     st.subheader("3. Phạm vi quét dữ liệu")
+    scan_source = st.radio(
+        "Nguồn thu thập ví",
+        options=["Kèo đang mở (Holders & Activity)", "Bảng xếp hạng (Leaderboard)"],
+        index=0,
+        help="Kèo đang mở giúp tìm cả các ví tầm trung; Leaderboard lấy trực tiếp top trader của Tag."
+    )
     selected_tag_label = st.selectbox(
         "Category Tag (Polymarket)",
         options=list(POLYMARKET_TAGS.keys()),
@@ -288,15 +319,14 @@ with st.sidebar:
     sub_keyword = st.text_input(
         "Từ khóa lọc sâu (tùy chọn)",
         value="",
-        placeholder="Để trống để quét toàn bộ tag đã chọn..."
+        placeholder="VD: temperature, bitcoin... (chỉ dùng cho Kèo đang mở)"
     )
     time_period = st.selectbox(
         "Khung thời gian tính PnL/Vol",
         options=["ALL", "MONTH", "WEEK"],
         index=0
     )
-    market_limit = st.slider("Số thị trường quét", min_value=5, max_value=100, value=25, step=5)
-    trades_per_market = st.slider("Số giao dịch/thị trường", min_value=50, max_value=500, value=100, step=50)
+    market_limit = st.slider("Độ sâu quét (Số kèo / Top Leaderboard)", min_value=10, max_value=150, value=30, step=10)
 
 
 # --- GIAO DIỆN CHÍNH ---
@@ -314,18 +344,27 @@ with tab_scan:
             st.info(f"Đang lưu sẵn **{len(st.session_state['raw_df'])}** hồ sơ ví trong bộ nhớ. Kéo chỉnh thông số bên trái để lọc lại ngay lập tức.")
 
     if start_scan:
+        tag_info = POLYMARKET_TAGS[selected_tag_label]
         progress = st.progress(0.0, text=f"Đang tải dữ liệu thuộc tag {selected_tag_label}...")
-        wallets = fetch_candidate_wallets(
-            tag_slug=POLYMARKET_TAGS[selected_tag_label],
-            sub_keyword=sub_keyword,
-            market_limit=market_limit,
-            trades_per_market=trades_per_market,
-            progress_bar=progress
-        )
+
+        if scan_source == "Bảng xếp hạng (Leaderboard)":
+            wallets = fetch_wallets_from_leaderboard(
+                lb_category=tag_info["lb_cat"],
+                time_period=time_period,
+                max_users=market_limit * 5,
+                progress_bar=progress
+            )
+        else:
+            wallets = fetch_wallets_from_active_markets(
+                tag_slug=tag_info["slug"],
+                sub_keyword=sub_keyword,
+                market_limit=market_limit,
+                progress_bar=progress
+            )
 
         if not wallets:
             progress.empty()
-            st.warning("Không tìm thấy giao dịch nào trong tag này. Hãy thử xóa từ khóa lọc sâu hoặc chọn tag khác.")
+            st.warning("Không tìm thấy ví nào ở nguồn này. Bạn hãy thử đổi sang nguồn quét còn lại hoặc chọn Tag khác.")
         else:
             raw_df = scan_profiles_concurrent(wallets, time_period=time_period, progress_bar=progress)
             progress.empty()
