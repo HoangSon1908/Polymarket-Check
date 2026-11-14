@@ -97,18 +97,18 @@ def fetch_from_leaderboard(lb_category: str, time_period: str, max_pages: int, p
     profiles = {}
     errors = []
     page_size = 50
-    sort_modes = ["PNL", "VOL"]
+    sort_modes = ["PNL", "VOLUME"]
     total_steps = max_pages * len(sort_modes)
     step = 0
 
-    for order_by in sort_modes:
+    for sort_by in sort_modes:
         cursor = None
         for page in range(max_pages):
             step += 1
             req_params = {
                 "category": lb_category,
                 "timePeriod": time_period,
-                "orderBy": order_by,
+                "sort_by": sort_by,
                 "limit": page_size,
             }
             if cursor:
@@ -157,7 +157,7 @@ def fetch_from_leaderboard(lb_category: str, time_period: str, max_pages: int, p
             if progress_bar:
                 progress_bar.progress(
                     min(step / total_steps, 1.0),
-                    text=f"Đang tải Leaderboard v2 ({lb_category} - {order_by}, trang {page + 1}/{max_pages}) — Đã gom {len(profiles)} ví..."
+                    text=f"Đang tải Leaderboard v2 ({lb_category} - {sort_by}, trang {page + 1}/{max_pages}) — Đã gom {len(profiles)} ví..."
                 )
             time.sleep(0.08)
 
@@ -276,7 +276,7 @@ def fetch_single_profile(wallet: str, time_period: str = "ALL"):
     try:
         lb_resp = request_data_api(
             "leaderboard",
-            params={"user": wallet, "timePeriod": time_period},
+            params={"user": wallet, "timePeriod": time_period, "sort_by": "PNL"},
             timeout=10
         )
         if lb_resp is None or lb_resp.status_code != 200:
