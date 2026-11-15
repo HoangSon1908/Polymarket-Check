@@ -42,6 +42,7 @@ def fetch_positions_v2(wallet: str, status_val: str) -> list[dict]:
         if not next_cursor or not has_more:
             break
 
+        # API v2 giữ nguyên anchor user & status khi dùng cursor, không truyền offset
         params = {
             "user": wallet.strip(),
             "status": status_val,
@@ -95,7 +96,9 @@ def evaluate_positions(
     df["entry_cost_usdc"] = pd.to_numeric(get_col(["entry_cost_usdc"]), errors="coerce").fillna(0.0)
     df["current_size"] = pd.to_numeric(get_col(["current_size"]), errors="coerce").fillna(0.0)
     df["current_value"] = pd.to_numeric(get_col(["current_value"]), errors="coerce").fillna(0.0)
-    df["unrealized_pnl"] = pd.to_numeric(get_col(["unrealized_pnl"]), errors="coerce").fillna(0.0)
+
+    raw_upnl = pd.to_numeric(get_col(["unrealized_pnl"]), errors="coerce")
+    df["unrealized_pnl"] = raw_upnl.fillna(df["current_value"] - df["entry_cost_usdc"])
 
     raw_cur_p = pd.to_numeric(get_col(["current_price"]), errors="coerce")
     implied_cur_p = np.where(df["current_size"] > 0, df["current_value"] / df["current_size"], df["avg_price"])
@@ -131,10 +134,20 @@ def evaluate_positions(
             reasons.append(f"Kèo đã ngã ngũ/sát giờ đóng (Giá {cur_p*100:.1f}¢)")
             continue
 
+        # Tách riêng các kèo thuộc giải đấu/từ khóa chặn sang bảng theo dõi riêng
         matched_kw = next((kw for kw in blocked_keywords if kw in title_lower), None)
         if matched_kw:
-            statuses.append("REJECTED")
-            reasons.append(f"Thuộc giải/từ khóa chặn ({matched_kw})")
+            statuses.append("BLOCKED_LEAGUE")
+            sub_notes = []
+            if raw_bet >= min_user_bet:
+                sub_notes.append("Đạt vốn >=$4k")
+            else:
+                sub_notes.append("Dưới vốn <$4k")
+            if (block_50_60 and 0.50 <= p < 0.60) or (p > max_fav_prob / 100.0):
+                sub_notes.append("Sai dải giá")
+            else:
+                sub_notes.append("Đúng dải giá")
+            reasons.append(f"[{matched_kw.upper()}] " + " • ".join(sub_notes))
             continue
 
         if raw_bet < min_user_bet:
@@ -196,9 +209,9 @@ with st.sidebar:
     max_fav_prob = st.slider("Chặn kèo chắc ăn trên (%)", min_value=70, max_value=99, value=85, step=5)
 
     blocked_kw_input = st.text_input(
-        "Từ khóa giải đấu chặn (cách nhau dấu phẩy)",
+        "Từ khóa giải đấu chặn (tách bảng riêng)",
         value="CCT Europe",
-        help="Mọi trận có chứa từ khóa này sẽ tự động bị loại bỏ.",
+        help="Các trận chứa từ khóa này sẽ được tách sang Bảng Theo Dõi Riêng ở Mục 3.",
     )
     blocked_keywords = [k.strip().lower() for k in blocked_kw_input.split(",") if k.strip()]
 
@@ -245,16 +258,19 @@ if evaluated_df.empty:
 
 valid_df = evaluated_df[evaluated_df["signal_group"] == "VALID"].sort_values("final_user_bet", ascending=False)
 slip_df = evaluated_df[evaluated_df["signal_group"] == "SLIPPAGE_WARN"].sort_values("final_user_bet", ascending=False)
+blocked_df = evaluated_df[evaluated_df["signal_group"] == "BLOCKED_LEAGUE"].sort_values("entry_cost_usdc", ascending=False)
 rej_df = evaluated_df[evaluated_df["signal_group"] == "REJECTED"].sort_values("entry_cost_usdc", ascending=False)
 
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("🟢 Kèo hợp lệ cần vào", f"{len(valid_df)} kèo", f"Tổng vốn cần: ${valid_df['final_user_bet'].sum():.2f}")
-m2.metric("🟡 Kèo đúng vùng nhưng trượt giá", f"{len(slip_df)} kèo", "Chờ giá hồi về trần mới vào")
-m3.metric("⚪ Kèo bị bộ lọc loại bỏ", f"{len(rej_df)} kèo", "Dưới ngưỡng, sai dải hoặc giải chặn")
-m4.metric("💰 Kèo vừa thắng chờ Redeem", f"{len(redeem_rows)} kèo", "Nhắc bấm Claim trên web")
+m1, m2, m3, m4, m5 = st.columns(5)
+m1.metric("🟢 Kèo hợp lệ cần vào", f"{len(valid_df)} kèo", f"Tổng vốn: ${valid_df['final_user_bet'].sum():.2f}")
+m2.metric("🟡 Quá trượt giá", f"{len(slip_df)} kèo", "Chờ giá hồi về trần")
+m3.metric("🚫 Giải chặn riêng", f"{len(blocked_df)} kèo", blocked_kw_input or "Trống")
+m4.metric("⚪ Loại vốn / dải giá", f"{len(rej_df)} kèo", "Dưới $4k hoặc sai dải")
+m5.metric("💰 Chờ Redeem", f"{len(redeem_rows)} kèo", "Nhắc bấm Claim")
 
 st.divider()
 
+# --- MỤC 1: KÈO HỢP LỆ ---
 st.subheader(f"🟢 1. Danh sách Kèo Hợp Lệ — Vào Lệnh Ngay ({len(valid_df)})")
 if valid_df.empty:
     st.info("Chưa có kèo nào đạt đủ điều kiện ở thời điểm hiện tại. Hãy quay lại quét trước giờ các trận CS2 diễn ra.")
@@ -283,6 +299,7 @@ else:
         },
     )
 
+# --- MỤC 2: KÈO QUÁ TRƯỢT GIÁ ---
 if not slip_df.empty:
     st.subheader(f"🟡 2. Kèo Đạt Điều Kiện Nhưng Đang Quá Trượt Giá ({len(slip_df)})")
     st.caption("Không đuổi giá thị trường ở các kèo này; chỉ đặt lệnh Limit ở cột **Giá trần tối đa** nếu muốn chờ khớp.")
@@ -310,7 +327,38 @@ if not slip_df.empty:
         },
     )
 
-with st.expander(f"⚪ Xem {len(rej_df)} vị thế đang mở bị bộ lọc loại bỏ"):
+# --- MỤC 3: BẢNG THEO DÕI RIÊNG GIẢI ĐẤU CHẶN (CCT EUROPE) ---
+st.subheader(f"🚫 3. Bảng Theo Dõi Riêng: Giải Đấu Chặn ({len(blocked_df)})")
+if blocked_df.empty:
+    st.caption("Hiện tại ví gốc không có vị thế đang mở nào thuộc danh sách giải chặn.")
+else:
+    st.caption("Bảng này chỉ để theo dõi phong độ của ví ở giải chặn (hệ thống tự động chặn không vào tiền).")
+    disp_blocked = blocked_df[
+        ["title", "outcome", "reason", "entry_cost_usdc", "final_user_bet", "avg_price", "cur_price", "unrealized_pnl", "last_buy_ago", "url"]
+    ].copy()
+    disp_blocked["avg_price"] = disp_blocked["avg_price"] * 100.0
+    disp_blocked["cur_price"] = disp_blocked["cur_price"] * 100.0
+
+    st.dataframe(
+        disp_blocked,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "title": st.column_config.TextColumn("Trận đấu (Giải chặn)", width="large"),
+            "outcome": st.column_config.TextColumn("Cửa chọn"),
+            "reason": st.column_config.TextColumn("Trạng thái điều kiện", width="medium"),
+            "entry_cost_usdc": st.column_config.NumberColumn("Vốn ví gốc ($)", format="$%,.0f"),
+            "final_user_bet": st.column_config.NumberColumn("Quy đổi ($)", format="$%.2f"),
+            "avg_price": st.column_config.NumberColumn("Giá ví gốc", format="%.1f¢"),
+            "cur_price": st.column_config.NumberColumn("Giá hiện tại", format="%.1f¢"),
+            "unrealized_pnl": st.column_config.NumberColumn("PnL tạm tính ví ($)", format="$%+,.2f"),
+            "last_buy_ago": st.column_config.TextColumn("Lệnh cuối"),
+            "url": st.column_config.LinkColumn("Xem kèo", display_text="Mở Polymarket"),
+        },
+    )
+
+# --- MỤC 4: CÁC VỊ THẾ BỊ LOẠI KHÁC & REDEEMABLE ---
+with st.expander(f"⚪ Xem {len(rej_df)} vị thế bị loại do vốn nhỏ hoặc sai dải giá"):
     disp_rej = rej_df[["reason", "title", "outcome", "avg_price", "entry_cost_usdc", "raw_user_bet", "last_buy_ago"]].copy()
     disp_rej["avg_price"] = disp_rej["avg_price"] * 100.0
     st.dataframe(
