@@ -8,7 +8,14 @@ st.set_page_config(
     layout="wide"
 )
 
-DATA_API_URL = "https://data-api.polymarket.com/closed-positions"
+DATA_API_URL = "https://data-api.polymarket.com/v2/closed-positions"
+
+
+def pick_series(df: pd.DataFrame, candidates: list[str], default=0.0) -> pd.Series:
+    for col in candidates:
+        if col in df.columns:
+            return df[col]
+    return pd.Series([default] * len(df), index=df.index)
 
 
 @st.cache_data(ttl=300, show_spinner="Đang kéo lịch sử vị thế từ Polymarket...")
@@ -16,35 +23,84 @@ def fetch_closed_positions(wallet: str) -> pd.DataFrame:
     all_positions = []
     offset = 0
     limit = 50
+    cursor = None
 
     while True:
         params = {
             "user": wallet.strip(),
             "limit": limit,
-            "offset": offset,
             "sortBy": "TIMESTAMP",
             "sortDirection": "DESC",
         }
+        if cursor:
+            params["cursor"] = cursor
+        else:
+            params["offset"] = offset
+
         res = requests.get(DATA_API_URL, params=params, timeout=15)
         res.raise_for_status()
-        data = res.json()
+        payload = res.json()
+
+        # Hỗ trợ cả dạng trả về list trực tiếp lẫn dict bọc trong data/positions/results
+        next_cursor = None
+        if isinstance(payload, list):
+            data = payload
+        elif isinstance(payload, dict):
+            data = (
+                payload.get("data")
+                or payload.get("positions")
+                or payload.get("results")
+                or payload.get("items")
+                or []
+            )
+            next_cursor = (
+                payload.get("next_cursor")
+                or payload.get("nextCursor")
+                or payload.get("cursor")
+            )
+        else:
+            break
 
         if not data:
             break
+
         all_positions.extend(data)
-        if len(data) < limit:
-            break
-        offset += limit
+
+        if next_cursor and next_cursor != "LTE=":
+            cursor = next_cursor
+        else:
+            if len(data) < limit:
+                break
+            offset += limit
 
     if not all_positions:
         return pd.DataFrame()
 
     df = pd.DataFrame(all_positions)
 
-    # Chuẩn hóa kiểu dữ liệu số
-    numeric_cols = ["avgPrice", "totalBought", "realizedPnl", "curPrice"]
-    for col in numeric_cols:
-        df[col] = pd.to_numeric(df.get(col, 0), errors="coerce").fillna(0.0)
+    # Chuẩn hóa linh hoạt tên cột giữa các phiên bản API
+    df["avgPrice"] = pd.to_numeric(
+        pick_series(df, ["avgPrice", "avg_price", "averagePrice", "average_price"]),
+        errors="coerce",
+    ).fillna(0.0)
+
+    df["totalBought"] = pd.to_numeric(
+        pick_series(df, ["totalBought", "total_bought", "size", "shares", "amount"]),
+        errors="coerce",
+    ).fillna(0.0)
+
+    df["realizedPnl"] = pd.to_numeric(
+        pick_series(df, ["realizedPnl", "realized_pnl", "pnl", "cashPnl", "cash_pnl"]),
+        errors="coerce",
+    ).fillna(0.0)
+
+    df["curPrice"] = pd.to_numeric(
+        pick_series(df, ["curPrice", "cur_price", "currentPrice", "current_price", "closePrice"]),
+        errors="coerce",
+    ).fillna(0.0)
+
+    df["title"] = pick_series(df, ["title", "question", "market", "name"], default="N/A").astype(str)
+    df["outcome"] = pick_series(df, ["outcome", "side", "position"], default="").astype(str)
 
     df["cost"] = df["avgPrice"] * df["totalBought"]
     df["roi_pct"] = df.apply(
@@ -52,19 +108,22 @@ def fetch_closed_positions(wallet: str) -> pd.DataFrame:
         axis=1,
     )
     df["is_win"] = df["realizedPnl"] > 0
-
-    # Phân loại kèo giữ đến đáo hạn (giá cuối ~0 hoặc ~1) vs chốt/cắt sớm
     df["is_resolved"] = (df["curPrice"] <= 0.001) | (df["curPrice"] >= 0.999)
 
-    if "timestamp" in df.columns:
-        df["time"] = pd.to_datetime(df["timestamp"], unit="s", errors="coerce")
+    raw_time = pick_series(
+        df,
+        ["timestamp", "closedAt", "closed_at", "updatedAt", "updated_at", "createdAt"],
+        default=None,
+    )
+    if pd.api.types.is_numeric_dtype(raw_time):
+        df["time"] = pd.to_datetime(raw_time, unit="s", errors="coerce")
     else:
-        df["time"] = pd.NaT
+        df["time"] = pd.to_datetime(raw_time, errors="coerce")
 
-    if "eventSlug" in df.columns:
-        df["url"] = "https://polymarket.com/event/" + df["eventSlug"].astype(str)
-    else:
-        df["url"] = ""
+    slug_series = pick_series(df, ["eventSlug", "event_slug", "slug", "marketSlug"], default="")
+    df["url"] = slug_series.apply(
+        lambda s: f"https://polymarket.com/event/{s}" if pd.notna(s) and str(s).strip() else ""
+    )
 
     return df
 
@@ -132,7 +191,6 @@ if raw_df.empty:
     st.warning("Không tìm thấy vị thế đã đóng nào cho địa chỉ ví này.")
     st.stop()
 
-# Áp dụng bộ lọc
 df = raw_df.copy()
 if trade_type == "Chỉ kèo giữ đến đáo hạn":
     df = df[df["is_resolved"]]
@@ -146,7 +204,6 @@ if df.empty:
     st.warning("Không có lệnh nào khớp với bộ lọc hiện tại.")
     st.stop()
 
-# Chia 2 nhóm theo ngưỡng
 thresh = threshold_pct / 100.0
 under_df = df[df["avgPrice"] < thresh].copy()
 over_df = df[df["avgPrice"] > thresh].copy()
@@ -155,7 +212,6 @@ exact_df = df[df["avgPrice"] == thresh].copy()
 under_stats = summarize_bucket(under_df)
 over_stats = summarize_bucket(over_df)
 
-# --- TỔNG QUAN SO SÁNH ---
 col_left, col_right = st.columns(2)
 
 with col_left:
@@ -177,7 +233,6 @@ if len(exact_df) > 0:
 
 st.divider()
 
-# --- BIỂU ĐỒ PNL TÍCH LŨY ---
 if df["time"].notna().any():
     st.subheader("📈 Biểu đồ PnL tích lũy theo ngày")
     chart_df = df.dropna(subset=["time"]).copy()
@@ -192,7 +247,6 @@ if df["time"].notna().any():
     )
     st.line_chart(daily_pnl)
 
-# --- BẢNG CHI TIẾT ---
 st.subheader("📋 Chi tiết từng vị thế đã đóng")
 tab_under, tab_over, tab_all = st.tabs([
     f"Dưới {threshold_pct}% ({len(under_df)})",
