@@ -1,5 +1,6 @@
 import time
 from datetime import datetime, timezone
+import numpy as np
 import requests
 import pandas as pd
 import streamlit as st
@@ -41,7 +42,6 @@ def fetch_positions_v2(wallet: str, status_val: str) -> list[dict]:
         if not next_cursor or not has_more:
             break
 
-        # API v2 yêu cầu giữ nguyên anchor user & status khi dùng cursor, không truyền offset
         params = {
             "user": wallet.strip(),
             "status": status_val,
@@ -76,6 +76,7 @@ def evaluate_positions(
     max_slippage_cents: float,
     block_50_60: bool,
     max_fav_prob: float,
+    blocked_keywords: list[str],
 ) -> pd.DataFrame:
     if not raw_open:
         return pd.DataFrame()
@@ -96,16 +97,13 @@ def evaluate_positions(
     df["current_value"] = pd.to_numeric(get_col(["current_value"]), errors="coerce").fillna(0.0)
     df["unrealized_pnl"] = pd.to_numeric(get_col(["unrealized_pnl"]), errors="coerce").fillna(0.0)
 
-    # Giá thị trường hiện tại (ưu tiên current_price, fallback current_value / current_size)
     raw_cur_p = pd.to_numeric(get_col(["current_price"]), errors="coerce")
     implied_cur_p = np.where(df["current_size"] > 0, df["current_value"] / df["current_size"], df["avg_price"])
     df["cur_price"] = raw_cur_p.where(raw_cur_p.notna() & (raw_cur_p > 0), implied_cur_p).fillna(df["avg_price"])
 
-    # Quy tắc 1 & 3: Tính số tiền vào lệnh (không làm tròn lên, khóa trần max_user_cap)
     df["raw_user_bet"] = df["entry_cost_usdc"] * multiplier
     df["final_user_bet"] = df["raw_user_bet"].clip(upper=max_user_cap).round(2)
 
-    # Quy tắc 4: Tính độ trượt giá hiện tại & giá mua trần tối đa cho phép
     max_slip_dec = max_slippage_cents / 100.0
     df["slippage_cents"] = (df["cur_price"] - df["avg_price"]) * 100.0
     df["max_limit_cents"] = ((df["avg_price"] + max_slip_dec).clip(upper=0.99)) * 100.0
@@ -118,7 +116,6 @@ def evaluate_positions(
         lambda s: f"https://polymarket.com/event/{s}" if pd.notna(s) and str(s).strip() else ""
     )
 
-    # Phân loại từng kèo theo Bộ 5 Quy Tắc
     statuses = []
     reasons = []
 
@@ -127,21 +124,25 @@ def evaluate_positions(
         cur_p = r["cur_price"]
         raw_bet = r["raw_user_bet"]
         slip_c = r["slippage_cents"]
+        title_lower = r["title"].lower()
 
-        # Kiểm tra trận đã gần ngã ngũ / live sâu (giá về sát 0 hoặc 1)
         if cur_p <= 0.02 or cur_p >= 0.98:
             statuses.append("REJECTED")
             reasons.append(f"Kèo đã ngã ngũ/sát giờ đóng (Giá {cur_p*100:.1f}¢)")
             continue
 
-        # Quy tắc 1: Ngưỡng kích hoạt tối thiểu (>= $1.00, không làm tròn lên)
+        matched_kw = next((kw for kw in blocked_keywords if kw in title_lower), None)
+        if matched_kw:
+            statuses.append("REJECTED")
+            reasons.append(f"Thuộc giải/từ khóa chặn ({matched_kw})")
+            continue
+
         if raw_bet < min_user_bet:
             min_whale_req = min_user_bet / multiplier if multiplier > 0 else 0
             statuses.append("REJECTED")
-            reasons.append(f"Vốn ví gốc ${r['entry_cost_usdc']:,.0f} < ${min_whale_req:,.0f} (Lệnh bạn ${raw_bet:.2f} < ${min_user_bet:.2f})")
+            reasons.append(f"Vốn ví gốc ${r['entry_cost_usdc']:,.0f} < ${min_whale_req:,.0f} (Lệnh bạn ${raw_bet:.2f})")
             continue
 
-        # Quy tắc 2: Bộ lọc dải xác suất
         if block_50_60 and (0.50 <= p < 0.60):
             statuses.append("REJECTED")
             reasons.append(f"Dải cấm 50%–60% (Giá ví gốc {p*100:.1f}¢)")
@@ -152,26 +153,22 @@ def evaluate_positions(
             reasons.append(f"Dải cấm >{max_fav_prob:.0f}% (Biên lãi mỏng: {p*100:.1f}¢)")
             continue
 
-        # Quy tắc 4: Kiểm soát trượt giá
         if slip_c > max_slippage_cents:
             statuses.append("SLIPPAGE_WARN")
             reasons.append(f"Vượt trần trượt giá (+{slip_c:.1f}¢ > +{max_slippage_cents:.1f}¢)")
             continue
 
         statuses.append("VALID")
-        reasons.append("Đạt đủ 5 quy tắc")
+        reasons.append("Đạt đủ quy tắc")
 
     df["signal_group"] = statuses
     df["reason"] = reasons
     return df
 
 
-# Cần import numpy cho tính toán vectorized
-import numpy as np
-
 # ======================== SIDEBAR CẤU HÌNH ========================
 with st.sidebar:
-    st.header("⚙️ Tham số 5 Quy Tắc")
+    st.header("⚙️ Tham số Quy Tắc Copy")
     wallet_input = st.text_input("Địa chỉ ví theo dõi", value=DEFAULT_WALLET)
 
     multiplier = st.number_input(
@@ -198,6 +195,13 @@ with st.sidebar:
     block_50_60 = st.checkbox("Chặn dải lỗ 50% – 60%", value=True)
     max_fav_prob = st.slider("Chặn kèo chắc ăn trên (%)", min_value=70, max_value=99, value=85, step=5)
 
+    blocked_kw_input = st.text_input(
+        "Từ khóa giải đấu chặn (cách nhau dấu phẩy)",
+        value="CCT Europe",
+        help="Mọi trận có chứa từ khóa này sẽ tự động bị loại bỏ.",
+    )
+    blocked_keywords = [k.strip().lower() for k in blocked_kw_input.split(",") if k.strip()]
+
     st.divider()
     st.caption(
         f"**Ngưỡng kích hoạt ví gốc:** Vốn vào của họ phải từ **${min_user_bet / multiplier:,.0f}** "
@@ -205,14 +209,14 @@ with st.sidebar:
     )
 
 # ======================== MAIN UI ========================
-st.title("⚡ Trạm Quét Lệnh Copy-Trade (Áp dụng sẵn 5 Quy Tắc)")
+st.title("⚡ Trạm Quét Lệnh Copy-Trade")
 
 top_col1, top_col2 = st.columns([1.2, 3])
 with top_col1:
     scan_clicked = st.button("🔍 QUÉT LỆNH HỢP LỆ NGAY", type="primary", use_container_width=True)
 
 if "scan_data" not in st.session_state or scan_clicked:
-    with st.spinner("Đang quét vị thế OPEN & REDEEMABLE trực tiếp từ Polymarket API v2..."):
+    with st.spinner("Đang quét vị thế OPEN & REDEEMABLE từ Polymarket API v2..."):
         try:
             open_rows = fetch_positions_v2(wallet_input, "OPEN")
             redeem_rows = fetch_positions_v2(wallet_input, "REDEEMABLE")
@@ -222,7 +226,7 @@ if "scan_data" not in st.session_state or scan_clicked:
             st.stop()
 
 open_rows, redeem_rows, last_scan_str = st.session_state["scan_data"]
-top_col2.caption(f"Cập nhật lần cuối lúc: **{last_scan_str}** | Tổng vị thế đang mở của ví: **{len(open_rows)}**")
+top_col2.caption(f"Cập nhật lần cuối lúc: **{last_scan_str} (UTC)** | Tổng vị thế đang mở của ví: **{len(open_rows)}**")
 
 evaluated_df = evaluate_positions(
     open_rows,
@@ -232,6 +236,7 @@ evaluated_df = evaluate_positions(
     max_slippage_cents=max_slippage_cents,
     block_50_60=block_50_60,
     max_fav_prob=float(max_fav_prob),
+    blocked_keywords=blocked_keywords,
 )
 
 if evaluated_df.empty:
@@ -242,19 +247,17 @@ valid_df = evaluated_df[evaluated_df["signal_group"] == "VALID"].sort_values("fi
 slip_df = evaluated_df[evaluated_df["signal_group"] == "SLIPPAGE_WARN"].sort_values("final_user_bet", ascending=False)
 rej_df = evaluated_df[evaluated_df["signal_group"] == "REJECTED"].sort_values("entry_cost_usdc", ascending=False)
 
-# --- CHỈ SỐ TỔNG QUAN NHANH ---
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("🟢 Kèo hợp lệ cần vào", f"{len(valid_df)} kèo", f"Tổng vốn cần: ${valid_df['final_user_bet'].sum():.2f}")
 m2.metric("🟡 Kèo đúng vùng nhưng trượt giá", f"{len(slip_df)} kèo", "Chờ giá hồi về trần mới vào")
-m3.metric("⚪ Kèo bị bộ lọc loại bỏ", f"{len(rej_df)} kèo", "Dưới $4k hoặc sai dải giá")
+m3.metric("⚪ Kèo bị bộ lọc loại bỏ", f"{len(rej_df)} kèo", "Dưới ngưỡng, sai dải hoặc giải chặn")
 m4.metric("💰 Kèo vừa thắng chờ Redeem", f"{len(redeem_rows)} kèo", "Nhắc bấm Claim trên web")
 
 st.divider()
 
-# --- BẢNG 1: KÈO HỢP LỆ VÀO LỆNH NGAY ---
 st.subheader(f"🟢 1. Danh sách Kèo Hợp Lệ — Vào Lệnh Ngay ({len(valid_df)})")
 if valid_df.empty:
-    st.info("Chưa có kèo nào đạt đủ cả 5 quy tắc ở thời điểm hiện tại. Hãy quay lại quét trước giờ các trận CS2 diễn ra.")
+    st.info("Chưa có kèo nào đạt đủ điều kiện ở thời điểm hiện tại. Hãy quay lại quét trước giờ các trận CS2 diễn ra.")
 else:
     disp_valid = valid_df[
         ["title", "outcome", "final_user_bet", "avg_price", "cur_price", "slippage_cents", "max_limit_cents", "entry_cost_usdc", "last_buy_ago", "url"]
@@ -280,9 +283,8 @@ else:
         },
     )
 
-# --- BẢNG 2: KÈO QUÁ TRƯỢT GIÁ ---
 if not slip_df.empty:
-    st.subheader(f"🟡 2. Kèo Đạt Ngưỡng Vốn & Dải Giá Nhưng Đang Quá Trượt Giá ({len(slip_df)})")
+    st.subheader(f"🟡 2. Kèo Đạt Điều Kiện Nhưng Đang Quá Trượt Giá ({len(slip_df)})")
     st.caption("Không đuổi giá thị trường ở các kèo này; chỉ đặt lệnh Limit ở cột **Giá trần tối đa** nếu muốn chờ khớp.")
     disp_slip = slip_df[
         ["title", "outcome", "final_user_bet", "avg_price", "cur_price", "slippage_cents", "max_limit_cents", "entry_cost_usdc", "last_buy_ago", "url"]
@@ -308,8 +310,7 @@ if not slip_df.empty:
         },
     )
 
-# --- BẢNG 3: KÈO BỊ LOẠI & KÈO CHỜ REDEEM ---
-with st.expander(f"⚪ Xem {len(rej_df)} vị thế đang mở bị loại bởi Bộ 5 Quy Tắc"):
+with st.expander(f"⚪ Xem {len(rej_df)} vị thế đang mở bị bộ lọc loại bỏ"):
     disp_rej = rej_df[["reason", "title", "outcome", "avg_price", "entry_cost_usdc", "raw_user_bet", "last_buy_ago"]].copy()
     disp_rej["avg_price"] = disp_rej["avg_price"] * 100.0
     st.dataframe(
@@ -328,7 +329,7 @@ with st.expander(f"⚪ Xem {len(rej_df)} vị thế đang mở bị loại bởi
     )
 
 if redeem_rows:
-    with st.expander(f"💰 Xem {len(redeem_rows)} kèo của ví vừa ngã ngũ (REDEEMABLE) — Nhắc bạn bấm Claim nếu đã theo"):
+    with st.expander(f"💰 Xem {len(redeem_rows)} kèo của ví vừa ngã ngũ (REDEEMABLE) — Nhắc bấm Claim"):
         red_df = pd.DataFrame(redeem_rows)
         cols_r = [c for c in ["title", "outcome", "avg_price", "unrealized_pnl"] if c in red_df.columns]
         if cols_r:
