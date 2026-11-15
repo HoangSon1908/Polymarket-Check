@@ -9,46 +9,63 @@ st.set_page_config(
 )
 
 POSITIONS_API_URL = "https://data-api.polymarket.com/v2/positions"
+ALL_STATUSES = ["CLOSED", "REDEEMABLE", "REDEEMABLE_LOST", "OPEN", "MERGEABLE"]
 SETTLED_STATUSES = ["CLOSED", "REDEEMABLE", "REDEEMABLE_LOST"]
 
 
-@st.cache_data(ttl=300, show_spinner="Đang kéo dữ liệu từ Polymarket Data API v2...")
-def fetch_all_positions(wallet: str) -> tuple[pd.DataFrame, dict]:
+@st.cache_data(ttl=300, show_spinner="Đang kéo dữ liệu từng trạng thái từ Polymarket API v2...")
+def fetch_positions_by_statuses(wallet: str, statuses: tuple[str, ...]) -> tuple[pd.DataFrame, dict, list[str]]:
     all_rows = []
-    params = {
-        "user": wallet.strip(),
-        "limit": 500,
-    }
+    warnings = []
     max_pages = 100
 
-    for _ in range(max_pages):
-        res = requests.get(POSITIONS_API_URL, params=params, timeout=15)
-        res.raise_for_status()
-        payload = res.json()
-
-        # Theo contract v2: data có thể là list hoặc null
-        batch = payload.get("data") or []
-        all_rows.extend(batch)
-
-        pagination = payload.get("pagination") or {}
-        next_cursor = pagination.get("next_cursor")
-        has_more = pagination.get("has_more", False)
-
-        # Dừng khi next_cursor là null hoặc has_more là False
-        if not next_cursor or not has_more:
-            break
-
-        # Pagination v2 chỉ dùng cursor, giữ nguyên anchor user, không gửi offset
+    for status_val in statuses:
         params = {
             "user": wallet.strip(),
-            "cursor": next_cursor,
+            "status": status_val,
+            "limit": 500,
         }
 
+        for _ in range(max_pages):
+            try:
+                res = requests.get(POSITIONS_API_URL, params=params, timeout=15)
+                res.raise_for_status()
+            except requests.HTTPError as e:
+                code = e.response.status_code if e.response is not None else "ERR"
+                warnings.append(f"status={status_val} trả về HTTP {code}")
+                break
+
+            payload = res.json()
+            batch = payload.get("data") or []
+            for item in batch:
+                if "status" not in item or not item["status"]:
+                    item["status"] = status_val
+            all_rows.extend(batch)
+
+            pagination = payload.get("pagination") or {}
+            next_cursor = pagination.get("next_cursor")
+            has_more = pagination.get("has_more", False)
+
+            if not next_cursor or not has_more:
+                break
+
+            # Giữ nguyên anchor user và status khi duyệt cursor
+            params = {
+                "user": wallet.strip(),
+                "status": status_val,
+                "cursor": next_cursor,
+            }
+
     if not all_rows:
-        return pd.DataFrame(), {}
+        return pd.DataFrame(), {}, warnings
 
     sample_raw = all_rows[0]
     df = pd.DataFrame(all_rows)
+
+    # Loại bỏ trùng lặp nếu có
+    dedup_cols = [c for c in ["condition_id", "token_id", "outcome", "status"] if c in df.columns]
+    if dedup_cols:
+        df = df.drop_duplicates(subset=dedup_cols).reset_index(drop=True)
 
     def get_col(candidates: list[str], default=None) -> pd.Series:
         for c in candidates:
@@ -71,15 +88,30 @@ def fetch_all_positions(wallet: str) -> tuple[pd.DataFrame, dict]:
     df["total_pnl"] = df["realized_pnl"] + df["unrealized_pnl"]
     df["is_win"] = df["total_pnl"] > 0
 
-    # Tính vốn vào: ưu tiên tổng vốn ban đầu nếu API có trả về, fallback sang entry_cost_usdc
+    # Tính vốn vào: ưu tiên trường tổng vốn từ API, fallback sang entry_cost_usdc hoặc suy ngược từ PnL
     total_bought = pd.to_numeric(get_col(["total_bought", "totalBought"]), errors="coerce")
-    initial_value = pd.to_numeric(get_col(["initial_value", "initialValue", "bought_usdc"]), errors="coerce")
+    initial_value = pd.to_numeric(
+        get_col(["initial_value", "initialValue", "bought_usdc", "total_cost_usdc"]), errors="coerce"
+    )
 
     cost = initial_value.copy()
     cost = cost.where(cost.notna() & (cost > 0), total_bought * df["avg_price"])
     cost = cost.where(cost.notna() & (cost > 0), df["entry_cost_usdc"])
-    df["cost"] = pd.to_numeric(cost.where(cost > 0, other=pd.NA), errors="coerce")
 
+    # Nếu lệnh đã CLOSED (entry_cost_usdc = 0) và API không trả total_bought, ước tính vốn từ realized_pnl & avg_price
+    def estimate_closed_cost(row):
+        if pd.notna(row["cost"]) and row["cost"] > 0:
+            return row["cost"]
+        pnl = row["total_pnl"]
+        p = row["avg_price"]
+        if pnl < 0:
+            return abs(pnl)
+        if pnl > 0 and 0 < p < 1:
+            return pnl * p / (1.0 - p)
+        return pd.NA
+
+    df["cost"] = cost
+    df["cost"] = pd.to_numeric(df.apply(estimate_closed_cost, axis=1), errors="coerce")
     df["roi_pct"] = (df["total_pnl"] / df["cost"]) * 100
 
     raw_time = get_col(["closed_at", "updated_at", "timestamp", "end_date", "created_at"], default=None)
@@ -93,7 +125,7 @@ def fetch_all_positions(wallet: str) -> tuple[pd.DataFrame, dict]:
         lambda s: f"https://polymarket.com/event/{s}" if pd.notna(s) and str(s).strip() else ""
     )
 
-    return df, sample_raw
+    return df, sample_raw, warnings
 
 
 def summarize_bucket(sub_df: pd.DataFrame) -> dict:
@@ -136,10 +168,10 @@ with st.sidebar:
     )
 
     selected_statuses = st.multiselect(
-        "Trạng thái vị thế tính thống kê",
-        options=["CLOSED", "REDEEMABLE", "REDEEMABLE_LOST", "OPEN", "MERGEABLE"],
+        "Trạng thái vị thế cần lấy",
+        options=ALL_STATUSES,
         default=SETTLED_STATUSES,
-        help="Mặc định lấy 3 trạng thái đã kết thúc: CLOSED (đã đóng/claim), REDEEMABLE (thắng chờ claim), REDEEMABLE_LOST (thua).",
+        help="Mặc định gọi riêng từng status đã kết thúc: CLOSED, REDEEMABLE, REDEEMABLE_LOST.",
     )
 
     min_cost = st.number_input("Lọc vốn tối thiểu mỗi lệnh ($)", min_value=0.0, value=0.0, step=10.0)
@@ -154,26 +186,37 @@ if not wallet_input:
     st.info("Nhập địa chỉ ví `0x...` ở thanh bên trái để bắt đầu thống kê.")
     st.stop()
 
+if not selected_statuses:
+    st.warning("Hãy chọn ít nhất 1 trạng thái vị thế ở thanh bên trái.")
+    st.stop()
+
 try:
-    raw_df, sample_json = fetch_all_positions(wallet_input)
+    raw_df, sample_json, api_warnings = fetch_positions_by_statuses(
+        wallet_input, tuple(selected_statuses)
+    )
 except Exception as e:
     st.error(f"Lỗi khi gọi API Polymarket v2: {e}")
     st.stop()
 
+if api_warnings:
+    st.caption("Lưu ý từ API: " + " | ".join(api_warnings))
+
 if raw_df.empty:
-    st.warning("API trả về dữ liệu trống cho địa chỉ ví này.")
+    st.warning("Không tìm thấy vị thế nào ở các trạng thái đã chọn cho địa chỉ ví này.")
     st.stop()
 
-# Lọc theo trạng thái & mức vốn
-df = raw_df.copy()
-if selected_statuses:
-    df = df[df["status"].isin(selected_statuses)]
+# Hiển thị phân bổ số lượng theo từng status kéo được
+status_counts = raw_df["status"].value_counts().to_dict()
+st.caption("Số vị thế kéo được theo trạng thái: " + " | ".join(f"**{k}**: {v}" for k, v in status_counts.items()))
 
+df = raw_df.copy()
 if min_cost > 0:
     df = df[df["cost"].fillna(0) >= min_cost]
 
 if df.empty:
-    st.warning("Không có vị thế nào khớp với bộ lọc hiện tại.")
+    st.warning("Không có vị thế nào đạt mức vốn tối thiểu đang lọc.")
+    with st.expander("Xem cấu trúc JSON gốc từ /v2/positions"):
+        st.json(sample_json)
     st.stop()
 
 thresh = threshold_pct / 100.0
@@ -192,7 +235,7 @@ with col_left:
     m1.metric("Tỷ lệ thắng", f"{under_stats['win_rate']:.1f}%", f"{under_stats['wins']}/{under_stats['total']} kèo")
     roi_under_str = f"ROI: {under_stats['roi']:+.1f}%" if under_stats["roi"] is not None else "ROI: N/A"
     m2.metric("Lời / Lỗ ròng", f"${under_stats['pnl']:+,.2f}", roi_under_str)
-    m3.metric("Vốn ghi nhận", f"${under_stats['cost']:,.2f}")
+    m3.metric("Tổng vốn vào", f"${under_stats['cost']:,.2f}")
 
 with col_right:
     st.subheader(f"🟠 Kèo trên {threshold_pct}% (Favorite)")
@@ -200,7 +243,7 @@ with col_right:
     m1.metric("Tỷ lệ thắng", f"{over_stats['win_rate']:.1f}%", f"{over_stats['wins']}/{over_stats['total']} kèo")
     roi_over_str = f"ROI: {over_stats['roi']:+.1f}%" if over_stats["roi"] is not None else "ROI: N/A"
     m2.metric("Lời / Lỗ ròng", f"${over_stats['pnl']:+,.2f}", roi_over_str)
-    m3.metric("Vốn ghi nhận", f"${over_stats['cost']:,.2f}")
+    m3.metric("Tổng vốn vào", f"${over_stats['cost']:,.2f}")
 
 if len(exact_df) > 0:
     st.caption(f"Lưu ý: Có {len(exact_df)} vị thế khớp đúng mức {threshold_pct}% không nằm trong 2 cột trên.")
