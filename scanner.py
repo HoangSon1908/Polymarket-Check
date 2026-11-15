@@ -397,4 +397,7 @@ with tab_under:
 with tab_over:
     render_table(over_df, "over")
 with tab_all:
-    render_table(df, "
+    render_table(df, "all")
+
+with st.expander("Xem cấu trúc JSON mẫu trả về từ API"):
+    st.json(sample_json)
