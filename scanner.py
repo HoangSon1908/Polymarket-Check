@@ -169,7 +169,7 @@ def evaluate_positions(
     implied_cur_p = np.where(df["current_size"] > 0, df["current_value"] / df["current_size"], df["avg_price"])
     df["ref_price"] = raw_cur_p.where(raw_cur_p.notna() & (raw_cur_p > 0), implied_cur_p).fillna(df["avg_price"])
 
-    # Quy tắc 1 & 3: Nhân hệ số, không làm tròn lên, khóa trần max_user_cap
+    # Quy tắc 1 & 3: Nhân hệ số 0.00050, không làm tròn lên, khóa trần $10.00
     df["raw_user_bet"] = df["entry_cost_usdc"] * multiplier
     df["final_user_bet"] = df["raw_user_bet"].clip(upper=max_user_cap).round(2)
 
@@ -215,10 +215,13 @@ def evaluate_positions(
     statuses = []
     reasons = []
     action_notes = []
+    min_whale_req = min_user_bet / multiplier if multiplier > 0 else 0.0
 
     for _, r in df.iterrows():
         p = r["avg_price"]
         ref_p = r["ref_price"]
+        exec_p = r["exec_price"]
+        limit_p = r["max_limit_dec"]
         raw_bet = r["raw_user_bet"]
         user_bet = r["final_user_bet"]
         slip_c = r["slippage_cents"]
@@ -243,7 +246,7 @@ def evaluate_positions(
         matched_kw = next((kw for kw in blocked_keywords if kw in title_lower), None)
         if matched_kw:
             statuses.append("BLOCKED_LEAGUE")
-            sub_notes = ["Đạt vốn >=$4k" if raw_bet >= min_user_bet else "Dưới vốn <$4k"]
+            sub_notes = [f"Đạt vốn >=${min_whale_req:,.0f}" if raw_bet >= min_user_bet else f"Dưới vốn <${min_whale_req:,.0f}"]
             if (block_50_60 and 0.50 <= p < 0.60) or (p > max_fav_prob / 100.0):
                 sub_notes.append("Sai dải giá")
             else:
@@ -252,9 +255,8 @@ def evaluate_positions(
             action_notes.append("Không vào tiền")
             continue
 
-        # Quy tắc 1: Ngưỡng kích hoạt tối thiểu
+        # Quy tắc 1: Ngưỡng kích hoạt tối thiểu (>= $2,000 ví gốc / >= $1.00 bạn vào)
         if raw_bet < min_user_bet:
-            min_whale_req = min_user_bet / multiplier if multiplier > 0 else 0
             statuses.append("REJECTED")
             reasons.append(f"Vốn ví gốc ${r['entry_cost_usdc']:,.0f} < ${min_whale_req:,.0f} (Lệnh bạn ${raw_bet:.2f})")
             action_notes.append("")
@@ -274,10 +276,14 @@ def evaluate_positions(
             continue
 
         # Quy tắc 4: Kiểm soát trượt giá tăng quá trần (dựa trên Best Ask thực tế)
+        min_5sh_limit = 5.0 * limit_p
         if slip_c > max_slippage_cents:
             statuses.append("SLIPPAGE_WARN")
             reasons.append(f"Ask thực tế vượt trần (+{slip_c:.1f}¢ > +{max_slippage_cents:.1f}¢)")
-            action_notes.append("Chỉ đặt Limit ở Giá trần")
+            if user_bet < min_5sh_limit - 1e-6:
+                action_notes.append(f"Kê Limit trần (Min 5sh ~${min_5sh_limit:.2f})")
+            else:
+                action_notes.append("Chỉ đặt Limit ở Giá trần")
             continue
 
         statuses.append("VALID")
@@ -288,11 +294,17 @@ def evaluate_positions(
             notes.append(f"⚠️ Tụt >{drop_warn_cents:.0f}¢ (CHECK LIVE!)")
 
         if not live_ask:
-            notes.append("📋 Trống Ask (Kê Limit)")
+            if user_bet < min_5sh_limit - 1e-6:
+                notes.append(f"📋 Trống Ask (Limit cần >=5sh ~${min_5sh_limit:.2f})")
+            else:
+                notes.append("📋 Trống Ask (Kê Limit)")
         elif liq < user_bet:
-            notes.append(f"💧 Ask mỏng (${liq:.2f}/${user_bet:.2f})")
+            if user_bet < min_5sh_limit - 1e-6:
+                notes.append(f"💧 Ask mỏng (${liq:.2f}/${user_bet:.2f} | Limit >=5sh ~${min_5sh_limit:.2f})")
+            else:
+                notes.append(f"💧 Ask mỏng (${liq:.2f}/${user_bet:.2f})")
         elif not notes:
-            notes.append("✅ Khớp ngay (Check Pre-match)")
+            notes.append("✅ Khớp Market ngay (Check Pre-match)")
 
         action_notes.append(" | ".join(notes))
 
@@ -306,7 +318,7 @@ def evaluate_positions(
 if "entered_ids" not in st.session_state:
     st.session_state["entered_ids"] = set()
 
-# ======================== SIDEBAR CẤU HÌNH ========================
+# ======================== SIDEBAR CẤU HÌNH (CHỐT MẶC ĐỊNH TỐI ƯU) ========================
 with st.sidebar:
     st.header("⚙️ Tham số 5 Quy Tắc")
     wallet_input = st.text_input(
@@ -319,10 +331,10 @@ with st.sidebar:
         "Hệ số nhân quy mô (QT 5)",
         min_value=0.00001,
         max_value=1.0,
-        value=0.00025,
+        value=0.00050,
         step=0.00005,
         format="%.5f",
-        help="Giữ cố định 0.00025 suốt tháng đầu tiên trên vốn $100–$120.",
+        help="Mặc định 0.00050: lệnh >= $2,000 ví gốc tự khớp tối thiểu $1.00.",
     )
 
     col_s1, col_s2 = st.columns(2)
@@ -331,14 +343,14 @@ with st.sidebar:
         min_value=0.1,
         value=1.00,
         step=0.5,
-        help="Tương đương vốn ví gốc >= $4,000. Không làm tròn lên.",
+        help="Với hệ số 0.00050, $1.00 tương đương vốn ví gốc >= $2,000.",
     )
     max_user_cap = col_s2.number_input(
         "Trần tối đa ($) (QT 3)",
         min_value=1.0,
         value=10.00,
         step=1.0,
-        help="Khóa rủi ro tối đa $10/kèo (tương đương $40,000 ví gốc).",
+        help="Chốt trần an toàn $10.00/kèo (1% vốn $1,000; tương đương $20,000 ví gốc).",
     )
 
     max_slippage_cents = st.slider(
@@ -383,22 +395,23 @@ with st.sidebar:
 # ======================== MAIN UI ========================
 st.title("⚡ Trạm Quét Lệnh Copy-Trade CS2")
 
+min_whale_disp = min_user_bet / multiplier if multiplier > 0 else 0
 with st.expander("📋 Bảng Tóm Tắt 5 Quy Tắc & Cảnh Báo Thủ Công (Bấm để xem/thu gọn)", expanded=False):
     rule_col1, rule_col2 = st.columns(2)
     with rule_col1:
         st.markdown(
             "**🤖 Tool đã tự động lọc 100%:**\n"
-            "* **QT 1 (Ngưỡng vào):** Chỉ lấy kèo ví gốc `>= $4,000` (bạn vào `>= $1.00`, không làm tròn lên).\n"
-            "* **QT 2 (Dải giá & Giải):** Chỉ lấy `< 50%` hoặc `60% – 85%`; chặn `50%–60%`, `> 85%`, kèo Hedge 2 đầu và tách riêng **`CCT Europe`**.\n"
-            "* **QT 3 (Trần rủi ro):** Khóa tối đa **`$10.00/kèo`** (`min(Vốn ví × 0.00025, $10)`).\n"
-            "* **QT 4 (Trượt giá CLOB):** Đối soát trực tiếp **Best Ask** & **Thanh khoản** trên sổ lệnh; chặn Ask cao hơn ví gốc quá **`+2.5¢`**."
+            f"* **QT 1 (Ngưỡng vào):** Chỉ lấy kèo ví gốc `>= ${min_whale_disp:,.0f}` (bạn vào `>= ${min_user_bet:.2f}`, hệ số `{multiplier:.5f}`).\n"
+            f"* **QT 2 (Dải giá & Giải):** Chỉ lấy `< 50%` hoặc `60% – {max_fav_prob}%`; chặn `50%–60%`, `> {max_fav_prob}%`, kèo Hedge 2 đầu và tách riêng **`{blocked_kw_input}`**.\n"
+            f"* **QT 3 (Trần rủi ro):** Khóa tối đa **`${max_user_cap:.2f}/kèo`** (`min(Vốn ví × {multiplier:.5f}, ${max_user_cap:.0f})`).\n"
+            f"* **QT 4 (Trượt giá CLOB):** Đối soát trực tiếp **Best Ask** & **Thanh khoản** trên sổ lệnh; chặn Ask cao hơn ví gốc quá **`+{max_slippage_cents:.1f}¢`**."
         )
     with rule_col2:
         st.warning(
             "**⚠️ 3 việc BẮT BUỘC tự kiểm tra (Tool không tự chặn được):**\n"
-            "1. **Không vào kèo Live (QT 4):** Mở link Polymarket kiểm tra trận chưa bắt đầu thi đấu (đặc biệt khi thấy cờ `⚠️ Tụt >5¢`).\n"
+            f"1. **Không vào kèo Live (QT 4):** Mở link Polymarket kiểm tra trận chưa bắt đầu thi đấu (đặc biệt khi thấy cờ `⚠️ Tụt >{drop_warn_cents:.0f}¢`).\n"
             "2. **Giữ tới đáo hạn (QT 4):** Khớp xong giữ nguyên tới hết trận để bấm **Redeem**, không bán non giữa trận.\n"
-            "3. **Kỷ luật vốn $100–$120 (QT 5):** Giữ nguyên hệ số `0.00025` suốt tháng đầu; khi tổng ví vượt **`$150`**, rút lãi dôi ra đưa vốn về **`$100–$120`**."
+            f"3. **Kỷ luật hệ số `{multiplier:.5f}` & trần `${max_user_cap:.0f}` (QT 5):** Giữ ổn định quy mô theo ngân sách đã định, không nhồi tay ngoài công thức."
         )
 
 top_col1, top_col2 = st.columns([1.2, 3])
@@ -452,7 +465,6 @@ hedged_df = evaluated_df[evaluated_df["signal_group"] == "HEDGED"].sort_values([
 blocked_df = evaluated_df[evaluated_df["signal_group"] == "BLOCKED_LEAGUE"].sort_values("entry_cost_usdc", ascending=False).copy()
 rej_df = evaluated_df[evaluated_df["signal_group"] == "REJECTED"].sort_values("entry_cost_usdc", ascending=False).copy()
 
-# Tính tổng vốn còn lại cần vào (loại trừ các kèo đã tick Đã vào)
 pending_valid_df = valid_df[~valid_df["pos_key"].isin(st.session_state["entered_ids"])]
 
 m1, m2, m3, m4, m5 = st.columns(5)
@@ -518,7 +530,6 @@ else:
         },
     )
 
-    # Đồng bộ trạng thái checkbox Đã vào (an toàn kể cả khi người dùng sort bảng)
     checked_valid_keys = set(valid_df.loc[edited_valid.index[edited_valid["entered"]], "pos_key"])
     unchecked_valid_keys = set(valid_df.loc[edited_valid.index[~edited_valid["entered"]], "pos_key"])
     new_entered = (st.session_state["entered_ids"] | checked_valid_keys) - unchecked_valid_keys
@@ -537,6 +548,7 @@ if not slip_df.empty:
             "title",
             "outcome",
             "final_user_bet",
+            "action_note",
             "avg_price",
             "exec_price",
             "slippage_cents",
@@ -560,6 +572,7 @@ if not slip_df.empty:
             "title": st.column_config.TextColumn("Trận đấu (Market)", width="large"),
             "outcome": st.column_config.TextColumn("Cửa chọn"),
             "final_user_bet": st.column_config.NumberColumn("💵 Tiền bạn vào ($)", format="$%.2f"),
+            "action_note": st.column_config.TextColumn("Ghi chú Limit", width="medium"),
             "avg_price": st.column_config.NumberColumn("Giá ví gốc", format="%.1f¢"),
             "exec_price": st.column_config.NumberColumn("Giá Ask thực", format="%.1f¢"),
             "slippage_cents": st.column_config.NumberColumn("Trượt thực", format="%+.1f¢"),
@@ -648,7 +661,7 @@ with st.expander(f"⚪ Xem {len(rej_df)} vị thế bị loại do vốn nhỏ h
             "outcome": st.column_config.TextColumn("Cửa"),
             "avg_price": st.column_config.NumberColumn("Giá ví gốc", format="%.1f¢"),
             "entry_cost_usdc": st.column_config.NumberColumn("Vốn ví gốc ($)", format="$%,.2f"),
-            "raw_user_bet": st.column_config.NumberColumn("Quy đổi x0.00025", format="$%.2f"),
+            "raw_user_bet": st.column_config.NumberColumn(f"Quy đổi x{multiplier:.5f}", format="$%.2f"),
             "last_buy_ago": st.column_config.TextColumn("Lệnh cuối"),
         },
     )
