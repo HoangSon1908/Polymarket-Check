@@ -1,3 +1,5 @@
+import json
+import os
 import time
 from datetime import datetime, timedelta, timezone
 import numpy as np
@@ -15,9 +17,73 @@ POSITIONS_URL = "https://data-api.polymarket.com/v2/positions"
 CLOB_BOOKS_URL = "https://clob.polymarket.com/books"
 GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
 DEFAULT_WALLET = "0xc9bfc7986767173b4f1c3fc9b2c6b255fc7381c0"
+STATE_FILE = "scanner_state.json"
 VN_TZ = timezone(timedelta(hours=7))
 
 
+# ======================== QUẢN LÝ TRẠNG THÁI BỀN VỮNG (CHỐNG MẤT KHI RELOAD) ========================
+def load_persisted_entered_ids() -> set[str]:
+    """Đọc danh sách pos_key đã tick từ file JSON trên server."""
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                ids = data.get("entered_ids", [])
+                if isinstance(ids, list):
+                    return {str(x).strip() for x in ids if str(x).strip()}
+        except Exception:
+            pass
+    return set()
+
+
+def get_url_entered_prefixes() -> set[str]:
+    """Lấy các mã rút gọn (12 ký tự đầu của pos_key) lưu trên thanh địa chỉ URL."""
+    try:
+        raw_q = st.query_params.get("entered", "")
+        if isinstance(raw_q, list):
+            raw_q = ",".join(raw_q)
+        return {p.strip() for p in str(raw_q).split(",") if p.strip()}
+    except Exception:
+        return set()
+
+
+def persist_entered_ids(entered_ids: set[str], active_keys: set[str] | None = None) -> None:
+    """Lưu trạng thái Đã vào xuống file JSON và đồng bộ mã ngắn lên URL query params."""
+    clean_ids = sorted({str(x).strip() for x in entered_ids if str(x).strip()})
+    # Giữ tối đa 250 mã gần nhất để file JSON luôn gọn nhẹ
+    if len(clean_ids) > 250:
+        clean_ids = clean_ids[-250:]
+
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "entered_ids": clean_ids,
+                    "updated_at": datetime.now(VN_TZ).strftime("%Y-%m-%d %H:%M:%S"),
+                },
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+    except Exception:
+        pass
+
+    try:
+        keys_for_url = (
+            [k for k in clean_ids if k in active_keys]
+            if active_keys is not None
+            else clean_ids[-30:]
+        )
+        prefixes = sorted({k[:12] for k in keys_for_url if len(k) >= 6})
+        if prefixes:
+            st.query_params["entered"] = ",".join(prefixes)
+        elif "entered" in st.query_params:
+            del st.query_params["entered"]
+    except Exception:
+        pass
+
+
+# ======================== GỌI API POLYMARKET ========================
 def fetch_positions_v2(wallet: str, status_val: str) -> list[dict]:
     """Kéo vị thế theo chuẩn Polymarket Data API v2 (lọc status + phân trang cursor)."""
     rows = []
@@ -87,8 +153,7 @@ def fetch_gamma_events_meta(
 ) -> dict[str, dict]:
     """
     Tra cứu ngược tên giải gốc (event_title) & slug từ Gamma API theo condition_id.
-    Giúp chặn triệt để 100% kèo phụ (Map Handicap / Single Map) thuộc CCT Europe
-    dù tiêu đề market con không ghi tên giải đấu.
+    Giúp chặn triệt để 100% kèo phụ (Map Handicap / Single Map) thuộc CCT Europe.
     """
     meta_map: dict[str, dict] = dict(existing_cache or {})
     missing_ids = [
@@ -293,7 +358,6 @@ def evaluate_positions(
         liq = r["avail_liq_usdc"]
         live_ask = r["has_live_ask"]
 
-        # Ghép tiêu đề kèo + tên sự kiện gốc Gamma API + slug để chặn triệt để CCT Europe
         searchable_text = f"{r['title']} {r['gamma_event_title']} {r['gamma_event_slug']}".lower()
 
         if ref_p <= 0.02 or ref_p >= 0.98:
@@ -302,14 +366,12 @@ def evaluate_positions(
             action_notes.append("")
             continue
 
-        # Kiểm tra Hedge 2 đầu trước khi vào tiền
         if detect_hedge and r["condition_id"] in hedged_cids:
             statuses.append("HEDGED")
             reasons.append("Ví gốc đang giữ cả 2 cửa trên trận này")
             action_notes.append("🛑 Bỏ qua (Ví đang Hedge)")
             continue
 
-        # Quy tắc 2 (Giải đấu): Chặn cả kèo chính lẫn kèo phụ thuộc giải chặn (CCT Europe)
         matched_kw = next((kw for kw in blocked_keywords if kw in searchable_text), None)
         if matched_kw:
             statuses.append("BLOCKED_LEAGUE")
@@ -325,14 +387,12 @@ def evaluate_positions(
             action_notes.append("Không vào tiền")
             continue
 
-        # Quy tắc 1: Ngưỡng kích hoạt tối thiểu (>= $2,000 ví gốc / >= $1.00 bạn vào)
         if raw_bet < min_user_bet:
             statuses.append("REJECTED")
             reasons.append(f"Vốn ví gốc ${r['entry_cost_usdc']:,.0f} < ${min_whale_req:,.0f} (Lệnh bạn ${raw_bet:.2f})")
             action_notes.append("")
             continue
 
-        # Quy tắc 2 (Xác suất): Cấm 50–60% và >85%
         if block_50_60 and (0.50 <= p < 0.60):
             statuses.append("REJECTED")
             reasons.append(f"Dải cấm 50%–60% (Giá ví gốc {p*100:.1f}¢)")
@@ -345,7 +405,6 @@ def evaluate_positions(
             action_notes.append("")
             continue
 
-        # Quy tắc 4: Kiểm soát trượt giá tăng quá trần (dựa trên Best Ask thực tế)
         min_5sh_limit = 5.0 * limit_p
         if slip_c > max_slippage_cents:
             statuses.append("SLIPPAGE_WARN")
@@ -384,9 +443,11 @@ def evaluate_positions(
     return df
 
 
-# Khởi tạo bộ nhớ các kèo đã đánh dấu vào lệnh trong phiên & cache Gamma API
+# Khởi tạo bộ nhớ bền vững (nạp từ file JSON trên server ngay khi mở/reload trang)
 if "entered_ids" not in st.session_state:
-    st.session_state["entered_ids"] = set()
+    st.session_state["entered_ids"] = load_persisted_entered_ids()
+if "editor_ver" not in st.session_state:
+    st.session_state["editor_ver"] = 0
 if "gamma_meta_cache" not in st.session_state:
     st.session_state["gamma_meta_cache"] = {}
 
@@ -462,6 +523,8 @@ with st.sidebar:
     if st.session_state["entered_ids"]:
         if st.button(f"🧹 Xóa dấu Đã vào ({len(st.session_state['entered_ids'])})", use_container_width=True):
             st.session_state["entered_ids"] = set()
+            st.session_state["editor_ver"] += 1
+            persist_entered_ids(set(), active_keys=set())
             st.rerun()
 
 # ======================== MAIN UI ========================
@@ -538,6 +601,17 @@ if evaluated_df.empty:
     st.info("Hiện tại ví mục tiêu không có vị thế nào đang mở (OPEN).")
     st.stop()
 
+# Khôi phục thêm các kèo từ URL query params (nếu server vừa reboot) & đồng bộ lại
+all_active_keys = set(evaluated_df["pos_key"].tolist())
+url_prefixes = get_url_entered_prefixes()
+if url_prefixes:
+    matched_from_url = {
+        pk for pk in all_active_keys if any(pk.startswith(pref) for pref in url_prefixes)
+    }
+    if not matched_from_url.issubset(st.session_state["entered_ids"]):
+        st.session_state["entered_ids"] |= matched_from_url
+        persist_entered_ids(st.session_state["entered_ids"], active_keys=all_active_keys)
+
 valid_df = evaluated_df[evaluated_df["signal_group"] == "VALID"].sort_values("final_user_bet", ascending=False).copy()
 slip_df = evaluated_df[evaluated_df["signal_group"] == "SLIPPAGE_WARN"].sort_values("final_user_bet", ascending=False).copy()
 hedged_df = evaluated_df[evaluated_df["signal_group"] == "HEDGED"].sort_values(["condition_id", "entry_cost_usdc"], ascending=[True, False]).copy()
@@ -564,7 +638,7 @@ st.subheader(f"🟢 1. Danh sách Kèo Hợp Lệ — Vào Lệnh Ngay ({len(val
 if valid_df.empty:
     st.info("Chưa có kèo nào đạt đủ điều kiện ở thời điểm hiện tại. Hãy quay lại quét trước giờ các trận CS2 diễn ra.")
 else:
-    st.caption("Tick vào cột **Đã vào** sau khi khớp lệnh trên Polymarket để tránh vào trùng ở các lần quét sau.")
+    st.caption("Tick vào cột **Đã vào** sau khi khớp lệnh trên Polymarket (tự động lưu bền vững kể cả khi Reload trang).")
     valid_df["entered"] = valid_df["pos_key"].isin(st.session_state["entered_ids"])
     disp_valid = valid_df[
         [
@@ -590,7 +664,7 @@ else:
         disp_valid,
         use_container_width=True,
         hide_index=True,
-        key="editor_valid_signals",
+        key=f"editor_valid_signals_{st.session_state['editor_ver']}",
         disabled=[c for c in disp_valid.columns if c != "entered"],
         column_config={
             "entered": st.column_config.CheckboxColumn("✅ Đã vào", default=False),
@@ -614,6 +688,7 @@ else:
     new_entered = (st.session_state["entered_ids"] | checked_valid_keys) - unchecked_valid_keys
     if new_entered != st.session_state["entered_ids"]:
         st.session_state["entered_ids"] = new_entered
+        persist_entered_ids(new_entered, active_keys=all_active_keys)
         st.rerun()
 
 # --- MỤC 2: KÈO QUÁ TRƯỢT GIÁ ASK ---
@@ -644,7 +719,7 @@ if not slip_df.empty:
         disp_slip,
         use_container_width=True,
         hide_index=True,
-        key="editor_slip_signals",
+        key=f"editor_slip_signals_{st.session_state['editor_ver']}",
         disabled=[c for c in disp_slip.columns if c != "entered"],
         column_config={
             "entered": st.column_config.CheckboxColumn("✅ Đã kê Limit", default=False),
@@ -667,6 +742,7 @@ if not slip_df.empty:
     new_entered_slip = (st.session_state["entered_ids"] | checked_slip_keys) - unchecked_slip_keys
     if new_entered_slip != st.session_state["entered_ids"]:
         st.session_state["entered_ids"] = new_entered_slip
+        persist_entered_ids(new_entered_slip, active_keys=all_active_keys)
         st.rerun()
 
 # --- MỤC 3: CẢNH BÁO HEDGE 2 ĐẦU ---
