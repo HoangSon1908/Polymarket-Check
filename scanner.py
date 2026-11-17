@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import time
 from datetime import datetime, timedelta, timezone
 import numpy as np
@@ -50,7 +51,6 @@ def get_url_entered_prefixes() -> set[str]:
 def persist_entered_ids(entered_ids: set[str], active_keys: set[str] | None = None) -> None:
     """Lưu trạng thái Đã vào xuống file JSON và đồng bộ mã ngắn lên URL query params."""
     clean_ids = sorted({str(x).strip() for x in entered_ids if str(x).strip()})
-    # Giữ tối đa 250 mã gần nhất để file JSON luôn gọn nhẹ
     if len(clean_ids) > 250:
         clean_ids = clean_ids[-250:]
 
@@ -83,6 +83,35 @@ def persist_entered_ids(entered_ids: set[str], active_keys: set[str] | None = No
         pass
 
 
+# ======================== BỘ NHẬN DIỆN GIẢI ĐẤU 3 LỚP ========================
+def match_blocked_league(searchable_text: str, blocked_keywords: list[str]) -> str | None:
+    """
+    Lớp 1: Kiểm tra từ khóa chặn + nhận diện thông minh mọi biến thể CCT Europe
+    (vd: 'CCT Europe', 'CCT Season 3 Europe', 'CCT EU', 'cct-europe') mà không chặn nhầm CCT South America.
+    """
+    s = str(searchable_text or "").lower()
+    for kw in blocked_keywords:
+        if kw and kw in s:
+            return kw.upper()
+        if kw == "cct europe":
+            if re.search(r"\bcct\b(?:[\s\-_]+[\w#]+){0,3}[\s\-_]+(?:europe|eu)\b", s):
+                return "CCT EUROPE (REGEX)"
+    return None
+
+
+def extract_team_tokens(title: str) -> set[str]:
+    """Trích xuất tên đội từ tiêu đề trận chính để khóa chéo kèo phụ cùng trận nếu API ngoài lỗi."""
+    m = re.search(r"Counter-Strike:\s*(.+?)\s+vs\s+(.+?)(?:\s*\(BO|\s*-\s*Map|\s*$)", str(title), re.IGNORECASE)
+    if not m:
+        return set()
+    teams = set()
+    for raw_name in (m.group(1), m.group(2)):
+        clean = re.sub(r"[^a-z0-9\s\.]", "", raw_name.lower()).strip()
+        if len(clean) >= 3:
+            teams.add(clean)
+    return teams
+
+
 # ======================== GỌI API POLYMARKET ========================
 def fetch_positions_v2(wallet: str, status_val: str) -> list[dict]:
     """Kéo vị thế theo chuẩn Polymarket Data API v2 (lọc status + phân trang cursor)."""
@@ -111,7 +140,6 @@ def fetch_positions_v2(wallet: str, status_val: str) -> list[dict]:
         if not next_cursor or not has_more:
             break
 
-        # API v2 dùng cursor-only, giữ nguyên user & status và không truyền offset
         params = {
             "user": wallet.strip(),
             "status": status_val,
@@ -148,51 +176,85 @@ def fetch_clob_books(token_ids: list[str]) -> dict[str, dict]:
     return books_map
 
 
+def _parse_gamma_market_list(markets: list[dict], meta_map: dict[str, dict]) -> None:
+    for m in markets:
+        cid = str(m.get("conditionId") or m.get("condition_id") or "").strip().lower()
+        if not cid:
+            continue
+        events = m.get("events") or []
+        ev0 = events[0] if isinstance(events, list) and len(events) > 0 else {}
+        ev_title = str(ev0.get("title") or m.get("groupItemTitle") or m.get("question") or "").strip()
+        ev_slug = str(ev0.get("slug") or m.get("slug") or "").strip()
+        # Chỉ lưu cache khi thực sự lấy được tên sự kiện (tránh cache giá trị rỗng)
+        if ev_title or ev_slug:
+            meta_map[cid] = {
+                "event_title": ev_title,
+                "event_slug": ev_slug,
+            }
+
+
 def fetch_gamma_events_meta(
-    condition_ids: list[str], existing_cache: dict[str, dict] | None = None
-) -> dict[str, dict]:
+    pos_pairs: list[tuple[str, str]], existing_cache: dict[str, dict] | None = None
+) -> tuple[dict[str, dict], list[str]]:
     """
-    Tra cứu ngược tên giải gốc (event_title) & slug từ Gamma API theo condition_id.
-    Giúp chặn triệt để 100% kèo phụ (Map Handicap / Single Map) thuộc CCT Europe.
+    Lớp 2: Tra cứu ngược tên giải gốc (event_title) & slug từ Gamma API theo condition_ids,
+    tự động dự phòng bằng clob_token_ids nếu condition_id chưa khớp.
+    Trả về (meta_map, danh_sách_lỗi_nếu_có).
     """
     meta_map: dict[str, dict] = dict(existing_cache or {})
-    missing_ids = [
-        cid.strip().lower()
-        for cid in dict.fromkeys(condition_ids)
-        if cid and str(cid).strip() and cid.strip().lower() not in meta_map
-    ]
-    if not missing_ids:
-        return meta_map
+    errors: list[str] = []
 
-    for i in range(0, len(missing_ids), 25):
-        chunk = missing_ids[i : i + 25]
-        query_params = [("condition_ids", cid) for cid in chunk]
+    missing_pairs: list[tuple[str, str]] = []
+    seen_cids: set[str] = set()
+    for raw_cid, raw_tid in pos_pairs:
+        cid = str(raw_cid or "").strip().lower()
+        tid = str(raw_tid or "").strip()
+        if cid and cid not in seen_cids and cid not in meta_map:
+            seen_cids.add(cid)
+            missing_pairs.append((cid, tid))
+
+    if not missing_pairs:
+        return meta_map, errors
+
+    # Bước 2A: Tra cứu theo lô condition_ids
+    for i in range(0, len(missing_pairs), 20):
+        chunk = missing_pairs[i : i + 20]
+        query_params = [("condition_ids", cid) for cid, _ in chunk]
+        ok = False
         for _ in range(3):
             try:
                 res = requests.get(GAMMA_MARKETS_URL, params=query_params, timeout=10)
                 if res.status_code == 429:
                     time.sleep(1.5)
                     continue
-                if res.status_code == 200:
-                    markets = res.json()
-                    if isinstance(markets, list):
-                        for m in markets:
-                            cid = str(m.get("conditionId") or m.get("condition_id") or "").strip().lower()
-                            if not cid:
-                                continue
-                            events = m.get("events") or []
-                            ev0 = events[0] if isinstance(events, list) and len(events) > 0 else {}
-                            ev_title = str(ev0.get("title") or m.get("groupItemTitle") or m.get("question") or "").strip()
-                            ev_slug = str(ev0.get("slug") or m.get("slug") or "").strip()
-                            meta_map[cid] = {
-                                "event_title": ev_title,
-                                "event_slug": ev_slug,
-                            }
+                if res.status_code == 200 and isinstance(res.json(), list):
+                    _parse_gamma_market_list(res.json(), meta_map)
+                    ok = True
+                break
+            except Exception as e:
+                last_err = str(e)
+                time.sleep(0.5)
+        if not ok:
+            errors.append(f"Gamma condition_ids batch lỗi ({locals().get('last_err', 'HTTP')})")
+
+    # Bước 2B: Dự phòng bằng clob_token_ids cho bất kỳ condition_id nào vẫn chưa ra kết quả
+    still_missing = [(cid, tid) for cid, tid in missing_pairs if cid not in meta_map and tid]
+    for i in range(0, len(still_missing), 20):
+        chunk = still_missing[i : i + 20]
+        query_params = [("clob_token_ids", tid) for _, tid in chunk]
+        for _ in range(2):
+            try:
+                res = requests.get(GAMMA_MARKETS_URL, params=query_params, timeout=10)
+                if res.status_code == 429:
+                    time.sleep(1.5)
+                    continue
+                if res.status_code == 200 and isinstance(res.json(), list):
+                    _parse_gamma_market_list(res.json(), meta_map)
                 break
             except Exception:
                 time.sleep(0.5)
 
-    return meta_map
+    return meta_map, errors
 
 
 def parse_ask_metrics(book: dict, max_limit_dec: float) -> tuple[float | None, float]:
@@ -267,38 +329,47 @@ def evaluate_positions(
     df["current_size"] = pd.to_numeric(get_col(["current_size"]), errors="coerce").fillna(0.0)
     df["current_value"] = pd.to_numeric(get_col(["current_value"]), errors="coerce").fillna(0.0)
 
-    # Khóa định danh duy nhất cho từng vị thế để lưu trạng thái Đã vào lệnh
     df["pos_key"] = np.where(
         df["token_id"].str.strip() != "",
         df["token_id"].str.strip(),
         df["condition_id"].str.strip() + "_" + df["outcome"].str.strip(),
     )
 
-    # Gắn thông tin giải đấu gốc (event_title & event_slug) từ Gamma API
+    # Gắn thông tin giải đấu gốc từ Gamma API
     ev_titles = []
     ev_slugs = []
+    gamma_verified = []
     for cid in df["condition_id"]:
-        meta = gamma_meta_map.get(str(cid).strip().lower(), {})
-        ev_titles.append(meta.get("event_title", ""))
-        ev_slugs.append(meta.get("event_slug", ""))
+        c_norm = str(cid).strip().lower()
+        meta = gamma_meta_map.get(c_norm, {})
+        et = meta.get("event_title", "")
+        es = meta.get("event_slug", "")
+        ev_titles.append(et)
+        ev_slugs.append(es)
+        gamma_verified.append(bool(et or es))
     df["gamma_event_title"] = ev_titles
     df["gamma_event_slug"] = ev_slugs
+    df["gamma_verified"] = gamma_verified
+
+    # Lớp 3: Thu thập danh sách đội đang thi đấu ở các trận chính bị chặn (CCT Europe) trong cùng phiên quét
+    blocked_team_names: set[str] = set()
+    for _, r in df.iterrows():
+        s_txt = f"{r['title']} {r['gamma_event_title']} {r['gamma_event_slug']}"
+        if match_blocked_league(s_txt, blocked_keywords):
+            blocked_team_names |= extract_team_tokens(r["title"])
 
     # Chuẩn API v2: total_pnl = realized_pnl + unrealized_pnl
     realized_s = pd.to_numeric(get_col(["realized_pnl"]), errors="coerce").fillna(0.0)
     unrealized_s = pd.to_numeric(get_col(["unrealized_pnl"]), errors="coerce")
     df["total_pnl"] = realized_s + unrealized_s.fillna(df["current_value"] - df["entry_cost_usdc"])
 
-    # Giá tham chiếu từ /v2/positions (dùng làm fallback khi sổ lệnh không có Ask)
     raw_cur_p = pd.to_numeric(get_col(["current_price"]), errors="coerce")
     implied_cur_p = np.where(df["current_size"] > 0, df["current_value"] / df["current_size"], df["avg_price"])
     df["ref_price"] = raw_cur_p.where(raw_cur_p.notna() & (raw_cur_p > 0), implied_cur_p).fillna(df["avg_price"])
 
-    # Quy tắc 1 & 3: Nhân hệ số, không làm tròn lên, khóa trần $10.00
     df["raw_user_bet"] = df["entry_cost_usdc"] * multiplier
     df["final_user_bet"] = df["raw_user_bet"].clip(upper=max_user_cap).round(2)
 
-    # Quy tắc 4: Tính giá trần tối đa & đối chiếu Best Ask thực tế trên CLOB
     max_slip_dec = max_slippage_cents / 100.0
     df["max_limit_dec"] = (df["avg_price"] + max_slip_dec).clip(upper=0.99)
     df["max_limit_cents"] = df["max_limit_dec"] * 100.0
@@ -324,7 +395,6 @@ def evaluate_positions(
     df["has_live_ask"] = has_live_ask
     df["slippage_cents"] = (df["exec_price"] - df["avg_price"]) * 100.0
 
-    # Phát hiện các thị trường ví gốc đang ôm từ 2 cửa trở lên (Hedge 2 đầu)
     active_pos = df[(df["condition_id"].str.strip() != "") & (df["current_size"] > 0)]
     outcome_counts = active_pos.groupby("condition_id")["outcome"].nunique()
     hedged_cids = set(outcome_counts[outcome_counts >= 2].index)
@@ -357,8 +427,9 @@ def evaluate_positions(
         slip_c = r["slippage_cents"]
         liq = r["avail_liq_usdc"]
         live_ask = r["has_live_ask"]
+        title_str = r["title"]
 
-        searchable_text = f"{r['title']} {r['gamma_event_title']} {r['gamma_event_slug']}".lower()
+        searchable_text = f"{title_str} {r['gamma_event_title']} {r['gamma_event_slug']}"
 
         if ref_p <= 0.02 or ref_p >= 0.98:
             statuses.append("REJECTED")
@@ -372,7 +443,13 @@ def evaluate_positions(
             action_notes.append("🛑 Bỏ qua (Ví đang Hedge)")
             continue
 
-        matched_kw = next((kw for kw in blocked_keywords if kw in searchable_text), None)
+        # Kiểm tra chặn giải 3 lớp (Title/Slug + Gamma API + Khóa chéo cặp đội)
+        matched_kw = match_blocked_league(searchable_text, blocked_keywords)
+        if not matched_kw and blocked_team_names:
+            t_low = title_str.lower()
+            if any(re.search(rf"\b{re.escape(tm)}\b", t_low) for tm in blocked_team_names):
+                matched_kw = "CCT EUROPE (KHÓA CHÉO ĐỘI)"
+
         if matched_kw:
             statuses.append("BLOCKED_LEAGUE")
             sub_notes = [
@@ -383,7 +460,7 @@ def evaluate_positions(
             else:
                 sub_notes.append("Đúng dải giá")
             ev_label = f" • {r['gamma_event_title']}" if r["gamma_event_title"] else ""
-            reasons.append(f"[{matched_kw.upper()}{ev_label}] " + " • ".join(sub_notes))
+            reasons.append(f"[{matched_kw}{ev_label}] " + " • ".join(sub_notes))
             action_notes.append("Không vào tiền")
             continue
 
@@ -409,16 +486,22 @@ def evaluate_positions(
         if slip_c > max_slippage_cents:
             statuses.append("SLIPPAGE_WARN")
             reasons.append(f"Ask thực tế vượt trần (+{slip_c:.1f}¢ > +{max_slippage_cents:.1f}¢)")
-            if user_bet < min_5sh_limit - 1e-6:
-                action_notes.append(f"Kê Limit trần (Min 5sh ~${min_5sh_limit:.2f})")
-            else:
-                action_notes.append("Chỉ đặt Limit ở Giá trần")
+            note_slip = (
+                f"Kê Limit trần (Min 5sh ~${min_5sh_limit:.2f})"
+                if user_bet < min_5sh_limit - 1e-6
+                else "Chỉ đặt Limit ở Giá trần"
+            )
+            if not r["gamma_verified"]:
+                note_slip = "⚠️ Chưa xác minh giải (Gamma) | " + note_slip
+            action_notes.append(note_slip)
             continue
 
         statuses.append("VALID")
         reasons.append("Đạt đủ quy tắc")
 
         notes = []
+        if not r["gamma_verified"]:
+            notes.append("⚠️ Chưa xác minh giải (Check link)")
         if slip_c < -abs(drop_warn_cents):
             notes.append(f"⚠️ Tụt >{drop_warn_cents:.0f}¢ (CHECK LIVE!)")
 
@@ -443,7 +526,7 @@ def evaluate_positions(
     return df
 
 
-# Khởi tạo bộ nhớ bền vững (nạp từ file JSON trên server ngay khi mở/reload trang)
+# Khởi tạo bộ nhớ bền vững
 if "entered_ids" not in st.session_state:
     st.session_state["entered_ids"] = load_persisted_entered_ids()
 if "editor_ver" not in st.session_state:
@@ -451,7 +534,7 @@ if "editor_ver" not in st.session_state:
 if "gamma_meta_cache" not in st.session_state:
     st.session_state["gamma_meta_cache"] = {}
 
-# ======================== SIDEBAR CẤU HÌNH (CHỐT MẶC ĐỊNH TỐI ƯU) ========================
+# ======================== SIDEBAR CẤU HÌNH ========================
 with st.sidebar:
     st.header("⚙️ Tham số 5 Quy Tắc")
     wallet_input = st.text_input(
@@ -511,7 +594,7 @@ with st.sidebar:
     blocked_kw_input = st.text_input(
         "Từ khóa giải chặn — Bảng riêng (QT 2)",
         value="CCT Europe",
-        help="Tách riêng cả kèo chính lẫn kèo phụ (Map Handicap/Map Winner) thuộc giải này sang Mục 4.",
+        help="Phòng thủ 3 lớp: chặn cả biến thể CCT EU, kèo phụ qua Gamma API và khóa chéo theo cặp đội.",
     )
     blocked_keywords = [k.strip().lower() for k in blocked_kw_input.split(",") if k.strip()]
 
@@ -537,7 +620,7 @@ with st.expander("📋 Bảng Tóm Tắt 5 Quy Tắc & Cảnh Báo Thủ Công (
         st.markdown(
             "**🤖 Tool đã tự động lọc 100%:**\n"
             f"* **QT 1 (Ngưỡng vào):** Chỉ lấy kèo ví gốc >= ${min_whale_disp:,.0f} (bạn vào >= ${min_user_bet:.2f}, hệ số {multiplier:.5f}).\n"
-            f"* **QT 2 (Dải giá & Giải):** Chỉ lấy < 50% hoặc 60% – {max_fav_prob}%; chặn 50%–60%, > {max_fav_prob}%, kèo Hedge 2 đầu và lọc 100% **{blocked_kw_input}** (qua cả Gamma API).\n"
+            f"* **QT 2 (Dải giá & Giải):** Chỉ lấy < 50% hoặc 60% – {max_fav_prob}%; chặn 50%–60%, > {max_fav_prob}%, kèo Hedge 2 đầu và phòng thủ 3 lớp với **{blocked_kw_input}**.\n"
             f"* **QT 3 (Trần rủi ro):** Khóa tối đa **${max_user_cap:.2f}/kèo** (min(Vốn ví × {multiplier:.5f}, ${max_user_cap:.0f})).\n"
             f"* **QT 4 (Trượt giá CLOB):** Đối soát trực tiếp **Best Ask** & **Thanh khoản** trên sổ lệnh; chặn Ask cao hơn ví gốc quá **+{max_slippage_cents:.1f}¢**."
         )
@@ -554,7 +637,7 @@ with top_col1:
     scan_clicked = st.button("🔍 QUÉT LỆNH HỢP LỆ NGAY", type="primary", use_container_width=True)
 
 if "scan_data" not in st.session_state or scan_clicked:
-    with st.spinner("Đang quét vị thế API v2, tra giải gốc Gamma API & đối soát sổ lệnh CLOB..."):
+    with st.spinner("Đang quét vị thế API v2, xác minh giải gốc Gamma API & đối soát sổ lệnh CLOB..."):
         try:
             open_rows = fetch_positions_v2(wallet_input, "OPEN")
             redeem_rows = fetch_positions_v2(wallet_input, "REDEEMABLE")
@@ -562,25 +645,32 @@ if "scan_data" not in st.session_state or scan_clicked:
                 str(r.get("token_id") or r.get("asset") or r.get("asset_id") or "")
                 for r in open_rows
             ]
-            cond_list = [str(r.get("condition_id") or "") for r in open_rows]
+            pos_pairs = [
+                (
+                    str(r.get("condition_id") or ""),
+                    str(r.get("token_id") or r.get("asset") or r.get("asset_id") or ""),
+                )
+                for r in open_rows
+            ]
             books_map = fetch_clob_books(token_list)
-            gamma_meta_map = fetch_gamma_events_meta(
-                cond_list, existing_cache=st.session_state["gamma_meta_cache"]
+            gamma_meta_map, gamma_errors = fetch_gamma_events_meta(
+                pos_pairs, existing_cache=st.session_state["gamma_meta_cache"]
             )
             st.session_state["gamma_meta_cache"] = gamma_meta_map
             now_vn_str = datetime.now(VN_TZ).strftime("%H:%M:%S %d/%m/%Y (GMT+7)")
-            st.session_state["scan_data"] = (open_rows, redeem_rows, books_map, gamma_meta_map, now_vn_str)
+            st.session_state["scan_data"] = (
+                open_rows,
+                redeem_rows,
+                books_map,
+                gamma_meta_map,
+                gamma_errors,
+                now_vn_str,
+            )
         except Exception as e:
             st.error(f"Lỗi gọi API Polymarket: {e}")
             st.stop()
 
-open_rows, redeem_rows, books_map, gamma_meta_map, last_scan_str = st.session_state["scan_data"]
-top_col2.caption(
-    f"Cập nhật lần cuối: **{last_scan_str}** | "
-    f"Vị thế đang mở: **{len(open_rows)}** | "
-    f"Sổ lệnh CLOB: **{len(books_map)}** token | "
-    f"Giải gốc Gamma đã xác minh: **{len(gamma_meta_map)}** market"
-)
+open_rows, redeem_rows, books_map, gamma_meta_map, gamma_errors, last_scan_str = st.session_state["scan_data"]
 
 evaluated_df = evaluate_positions(
     open_rows,
@@ -597,11 +687,27 @@ evaluated_df = evaluate_positions(
     blocked_keywords=blocked_keywords,
 )
 
+verified_open_cnt = int(evaluated_df["gamma_verified"].sum()) if not evaluated_df.empty else 0
+unverified_open_cnt = len(evaluated_df) - verified_open_cnt
+
+top_col2.caption(
+    f"Cập nhật lần cuối: **{last_scan_str}** | "
+    f"Vị thế đang mở: **{len(open_rows)}** | "
+    f"Sổ lệnh CLOB: **{len(books_map)}** token | "
+    f"Gamma đã xác minh: **{verified_open_cnt}/{len(evaluated_df)}** vị thế"
+)
+
+if gamma_errors or unverified_open_cnt > 0:
+    st.warning(
+        f"⚠️ Cảnh báo xác minh giải đấu: Còn **{unverified_open_cnt}/{len(evaluated_df)}** vị thế chưa lấy được "
+        "tên sự kiện gốc từ Gamma API. Với các kèo phụ (Map Handicap / Single Map) có gắn cờ `⚠️ Chưa xác minh giải`, "
+        "hãy mở link Polymarket kiểm tra nhanh không thuộc **CCT Europe** trước khi bấm mua."
+    )
+
 if evaluated_df.empty:
     st.info("Hiện tại ví mục tiêu không có vị thế nào đang mở (OPEN).")
     st.stop()
 
-# Khôi phục thêm các kèo từ URL query params (nếu server vừa reboot) & đồng bộ lại
 all_active_keys = set(evaluated_df["pos_key"].tolist())
 url_prefixes = get_url_entered_prefixes()
 if url_prefixes:
@@ -774,7 +880,7 @@ st.subheader(f"🚫 4. Bảng Theo Dõi Riêng: Giải Đấu Chặn ({len(block
 if blocked_df.empty:
     st.caption("Hiện tại ví gốc không có vị thế đang mở nào thuộc danh sách giải chặn.")
 else:
-    st.caption("Bao gồm cả kèo chính lẫn kèo phụ (Map Handicap / Single Map) thuộc giải chặn được tra cứu qua Gamma API.")
+    st.caption("Bao gồm cả kèo chính lẫn kèo phụ (Map Handicap / Single Map) thuộc giải chặn qua bộ lọc 3 lớp.")
     disp_blocked = blocked_df[
         ["title", "outcome", "reason", "entry_cost_usdc", "final_user_bet", "avg_price", "exec_price", "total_pnl", "last_buy_ago", "url"]
     ].copy()
