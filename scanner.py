@@ -23,6 +23,45 @@ CLOB_API_BASE = "https://clob.polymarket.com"
 STATE_FILE = "scanner_state.json"
 VN_TZ = timezone(timedelta(hours=7))
 
+TEAM_ALIASES = {
+    "vp": "virtus.pro",
+    "baks": "baks esports",
+    "nxs": "nexus",
+    "ic.a": "inner circle academy",
+    "ice": "inner circle esports",
+    "ef": "eternal fire",
+    "g1": "genone",
+    "bca": "betclic apogee esports",
+    "priv": "private",
+    "ntr": "nuclear tigeres",
+    "pha": "phantom",
+    "all": "alliance",
+    "bcg": "bc.game esports",
+    "sng": "sangal",
+    "g2.a": "g2 ares",
+    "vit": "vitality",
+    "prv": "parivision",
+    "fal": "team falcons",
+    "tl": "liquid",
+    "mglz": "themongolz",
+    "lg": "luminosity",
+    "lgc": "legacy",
+    "fnc": "fnatic",
+    "hero": "heroic",
+    "imp": "imperial",
+    "aur": "aurora gaming",
+    "bb": "betboom team",
+    "ts": "spirit",
+    "navi": "natus vincere",
+    "ast": "astralis",
+    "gls": "galorys",
+    "bar": "barca",
+    "den": "dendele cs",
+    "100t": "100 thieves",
+    "gre": "grêmio esports",
+    "tdp": "turma do pagode",
+}
+
 
 # ======================== PERSISTENCE HELPERS ========================
 def short_hash(key: str) -> str:
@@ -265,9 +304,14 @@ def format_time_ago(raw_ts) -> str:
         return "—"
 
 
+def normalize_team_name(name: str) -> str:
+    clean_name = re.sub(r"\s+", " ", name).strip().lower()
+    return TEAM_ALIASES.get(clean_name, clean_name)
+
+
 def extract_team_pair(title: str) -> frozenset[str] | None:
     clean = re.sub(
-        r"^(Map\s*\d+\s*Winner|Map\s*Handicap|Total\s*Maps|Match\s*Winner|Winner)\s*:\s*",
+        r"^(Counter-Strike|CS2|Map\s*\d+\s*Rounds\s*Handicap|Map\s*\d+\s*Winner|Map\s*Handicap|Total\s*Maps|Match\s*Winner|Winner)\s*:\s*",
         "",
         title,
         flags=re.IGNORECASE,
@@ -276,8 +320,8 @@ def extract_team_pair(title: str) -> frozenset[str] | None:
     clean = re.split(r"\s+-\s+|\s+\|\s+", clean)[0].strip()
     m = re.split(r"\s+vs\.?\s+", clean, maxsplit=1, flags=re.IGNORECASE)
     if len(m) == 2:
-        t1 = m[0].strip().lower()
-        t2 = m[1].strip().lower()
+        t1 = normalize_team_name(m[0])
+        t2 = normalize_team_name(m[1])
         if len(t1) >= 2 and len(t2) >= 2:
             return frozenset({t1, t2})
     return None
