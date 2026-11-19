@@ -17,8 +17,7 @@ st.set_page_config(
 )
 
 DEFAULT_CS2_WALLET = "0xc9bfc7986767173b4f1c3fc9b2c6b255fc7381c0"
-DEFAULT_DOTA_INPUT = "0x3231d2d67053e5dc3715f6429124741e52866e75"
-DOTA_WALLET_PREFIX = "0x3231d2d67053c5dc3715f64291"
+DEFAULT_DOTA_WALLET = "0x3231d2d67053e5dc3715f6429124741e52866e75"
 
 DATA_API_BASE = "https://data-api.polymarket.com"
 GAMMA_API_BASE = "https://gamma-api.polymarket.com"
@@ -118,102 +117,7 @@ def persist_entered_ids(entered_ids: set[str], active_keys: set[str] | None = No
         pass
 
 
-# ======================== WALLET RESOLVER & API FETCHERS ========================
-def resolve_wallet_address(raw_input: str, expected_prefix: str = "") -> tuple[str, str]:
-    """
-    Chấp nhận cả địa chỉ 42 ký tự 0x... lẫn @username (ví dụ: @dotabotreborn)
-    và tự động tra cứu địa chỉ proxyWallet đầy đủ qua Polymarket API.
-    """
-    cleaned = raw_input.strip()
-    if not cleaned:
-        return "", "Chưa nhập địa chỉ ví hoặc username."
-
-    if EVM_ADDR_RE.match(cleaned):
-        return cleaned.lower(), ""
-
-    cache: dict[str, str] = st.session_state.setdefault("wallet_resolve_cache", {})
-    cache_key = cleaned.lower()
-    if cache_key in cache and EVM_ADDR_RE.match(cache[cache_key]):
-        return cache[cache_key], ""
-
-    handle = cleaned.lstrip("@").strip()
-    prefix_l = expected_prefix.lower().strip()
-
-    # 1. Tra cứu qua Gamma Public Search Profiles
-    try:
-        resp = requests.get(
-            f"{GAMMA_API_BASE}/public-search",
-            params={"q": handle, "search_profiles": "true", "limit_per_type": 10},
-            timeout=10,
-        )
-        if resp.ok:
-            data = resp.json()
-            profiles = data.get("profiles") or []
-            for p in profiles:
-                pw = str(p.get("proxyWallet") or p.get("address") or "").strip().lower()
-                uname = str(p.get("name") or p.get("pseudonym") or "").strip().lower()
-                if EVM_ADDR_RE.match(pw):
-                    if (prefix_l and pw.startswith(prefix_l)) or (uname == handle.lower()):
-                        cache[cache_key] = pw
-                        return pw, ""
-            for p in profiles:
-                pw = str(p.get("proxyWallet") or p.get("address") or "").strip().lower()
-                if EVM_ADDR_RE.match(pw):
-                    cache[cache_key] = pw
-                    return pw, ""
-    except Exception:
-        pass
-
-    # 2. Fallback qua Data API Leaderboard (tìm theo userName)
-    for ep in (f"{DATA_API_BASE}/v2/leaderboard", f"{DATA_API_BASE}/v1/leaderboard"):
-        try:
-            resp = requests.get(
-                ep,
-                params={"category": "OVERALL", "timePeriod": "ALL", "userName": handle, "limit": 10},
-                timeout=10,
-            )
-            if resp.ok:
-                payload = resp.json()
-                rows = payload.get("data") or [] if isinstance(payload, dict) else (payload or [])
-                for item in rows:
-                    pw = str(
-                        item.get("proxyWallet")
-                        or item.get("proxy_wallet")
-                        or item.get("user")
-                        or ""
-                    ).strip().lower()
-                    if EVM_ADDR_RE.match(pw):
-                        cache[cache_key] = pw
-                        return pw, ""
-        except Exception:
-            pass
-
-    # 3. Fallback đọc trang profile công khai polymarket.com/@username
-    if not cleaned.lower().startswith("0x"):
-        try:
-            page = requests.get(
-                f"https://polymarket.com/@{handle}",
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=10,
-            )
-            if page.ok:
-                if prefix_l:
-                    m_pref = re.search(rf"({re.escape(prefix_l)}[a-f0-9]{{14}})", page.text, re.IGNORECASE)
-                    if m_pref:
-                        pw = m_pref.group(1).lower()
-                        cache[cache_key] = pw
-                        return pw, ""
-                m_json = re.search(r'"proxyWallet"\s*:\s*"(0x[a-fA-F0-9]{40})"', page.text)
-                if m_json:
-                    pw = m_json.group(1).lower()
-                    cache[cache_key] = pw
-                    return pw, ""
-        except Exception:
-            pass
-
-    return "", f"Không tự phân giải được '{cleaned}'. Hãy dán trực tiếp địa chỉ 42 ký tự (0x...) của ví vào ô cấu hình."
-
-
+# ======================== API FETCHERS ========================
 def fetch_positions_by_status(wallet: str, status: str) -> list[dict]:
     results: list[dict] = []
     cursor = None
@@ -369,7 +273,6 @@ def safe_float(val, default: float = 0.0) -> float:
 
 
 def parse_time_info(raw_ts) -> tuple[str, float | None]:
-    """Trả về (chuỗi hiển thị thời gian trước, số phút tuổi lệnh)."""
     if not raw_ts:
         return "—", None
     try:
@@ -451,15 +354,18 @@ def matches_blocked_league(
     return False, ""
 
 
+def passes_required_market_substrings(title: str, req_substrings: list[str]) -> bool:
+    if not req_substrings:
+        return True
+    t_low = title.lower()
+    return any(sub in t_low for sub in req_substrings)
+
+
 def prepare_wallet_candidates(
     profile_cfg: dict,
     open_positions: list[dict],
     gamma_cache: dict[str, dict],
 ) -> tuple[list[dict], list[str]]:
-    """
-    Tiền xử lý danh sách vị thế OPEN của 1 profile ví (CS2 hoặc Dota 2),
-    trả về (danh sách dòng đã phân tích, danh sách token_id cần tra sổ lệnh CLOB).
-    """
     source_tag = profile_cfg["source_tag"]
     wallet = profile_cfg["wallet"]
     multiplier = float(profile_cfg["multiplier"])
@@ -469,6 +375,7 @@ def prepare_wallet_candidates(
     block_50_60 = bool(profile_cfg["block_50_60"])
     detect_hedge = bool(profile_cfg["detect_hedge"])
     blocked_keywords = profile_cfg["blocked_keywords"]
+    req_substrings = profile_cfg.get("required_market_substrings") or []
 
     parsed_rows: list[dict] = []
     blocked_team_pairs: set[frozenset[str]] = set()
@@ -528,6 +435,8 @@ def prepare_wallet_candidates(
         if is_blk and team_pair:
             blocked_team_pairs.add(team_pair)
 
+        mkt_type_ok = passes_required_market_substrings(title, req_substrings)
+
         parsed_rows.append(
             {
                 "source_tag": source_tag,
@@ -550,10 +459,10 @@ def prepare_wallet_candidates(
                 "is_blocked_direct": is_blk,
                 "blocked_reason": blk_reason,
                 "team_pair": team_pair,
+                "mkt_type_ok": mkt_type_ok,
             }
         )
 
-    # Layer 3: Cross-lock secondary markets matching blocked league team pairs
     for row in parsed_rows:
         if not row["is_blocked_direct"] and row["team_pair"] and row["team_pair"] in blocked_team_pairs:
             row["is_blocked_direct"] = True
@@ -571,6 +480,8 @@ def prepare_wallet_candidates(
             continue
         if row["is_blocked_direct"]:
             continue
+        if not row["mkt_type_ok"]:
+            continue
         if detect_hedge and row["cid_outcome_cnt"] >= 2:
             continue
         raw_bet = row["entry_cost_usdc"] * multiplier
@@ -587,9 +498,6 @@ def prepare_wallet_candidates(
 
 
 def evaluate_all_profiles(profiles_data: list[tuple[dict, list[dict], list[dict]]]) -> dict:
-    """
-    Chạy đánh giá hợp nhất cho tất cả các profile ví đang bật (CS2 + Dota 2).
-    """
     if "gamma_meta_cache" not in st.session_state:
         st.session_state["gamma_meta_cache"] = {}
 
@@ -648,7 +556,7 @@ def evaluate_all_profiles(profiles_data: list[tuple[dict, list[dict], list[dict]
             rejected_list.append(row)
             continue
 
-        # 2. Giải chặn (CCT Europe cho CS2)
+        # 2. Giải chặn (CCT Europe cho CS2 / Streamer & Media Eleague cho Dota)
         if row["is_blocked_direct"]:
             cond_notes = []
             if raw_bet < min_user_bet:
@@ -666,14 +574,20 @@ def evaluate_all_profiles(profiles_data: list[tuple[dict, list[dict], list[dict]
             blocked_list.append(row)
             continue
 
-        # 3. Hedge 2 đầu trên cùng condition_id
+        # 3. Bộ lọc loại kèo (ví dụ Dota chỉ đánh Game 1 & Game 2 Winner)
+        if not row["mkt_type_ok"]:
+            row["reject_reason"] = "Loại kèo (Chỉ lấy Game 1/2 Winner)"
+            rejected_list.append(row)
+            continue
+
+        # 4. Hedge 2 đầu trên cùng condition_id
         if detect_hedge and row["cid_outcome_cnt"] >= 2:
             row["raw_user_bet"] = round(raw_bet, 2)
             row["hedge_note"] = "Ví gốc đang mở >= 2 cửa cùng trận"
             hedge_list.append(row)
             continue
 
-        # 4. Ngưỡng vốn tối thiểu
+        # 5. Ngưỡng vốn tối thiểu
         if raw_bet < min_user_bet:
             min_whale_req = min_user_bet / multiplier if multiplier > 0 else 0
             row["reject_reason"] = (
@@ -682,7 +596,7 @@ def evaluate_all_profiles(profiles_data: list[tuple[dict, list[dict], list[dict]
             rejected_list.append(row)
             continue
 
-        # 5. Bộ lọc dải xác suất theo từng chiến lược
+        # 6. Bộ lọc dải xác suất theo từng chiến lược
         if avg_p <= 0.0 or avg_p < (min_prob_pct / 100.0):
             row["reject_reason"] = f"Kèo Underdog sâu < {min_prob_pct}% ({avg_p * 100:.1f}¢)"
             rejected_list.append(row)
@@ -696,7 +610,7 @@ def evaluate_all_profiles(profiles_data: list[tuple[dict, list[dict], list[dict]
             rejected_list.append(row)
             continue
 
-        # 6. Đánh giá sổ lệnh CLOB & Tốc độ Taker
+        # 7. Đánh giá sổ lệnh CLOB & Độ trễ Taker
         max_limit_price = min(avg_p + (max_slippage_cents / 100.0), 0.99)
         max_limit_cents = round(max_limit_price * 100.0, 1)
 
@@ -790,10 +704,10 @@ if "last_scan_time" not in st.session_state:
 
 # ======================== SIDEBAR CONFIG (2 PROFILES) ========================
 with st.sidebar:
-    st.header("🎛️ Cấu Hình 2 Chiến Lược Copy")
+    st.header("🎛️ Cấu Hình 2 Chiến Lược Signal")
 
     # --- PROFILE 1: CS2 ---
-    with st.expander("🎮 Ví 1: CS2 Whale (Pre-Match)", expanded=True):
+    with st.expander("🎮 Ví 1: CS2 Whale (Pre-Match)", expanded=False):
         enable_cs2 = st.checkbox("Bật quét ví CS2", value=True, key="en_cs2")
         cs2_wallet_raw = st.text_input(
             "Địa chỉ ví CS2",
@@ -817,7 +731,6 @@ with st.sidebar:
             value=2.00,
             step=0.5,
             key="min_cs2",
-            help="0.00100 × $2,000 = $2.00",
         )
         cs2_max_cap = c1_b.number_input(
             "Trần tối đa ($)",
@@ -826,52 +739,33 @@ with st.sidebar:
             step=1.0,
             key="max_cs2",
         )
-        cs2_slip = st.slider(
-            "Trượt giá Ask tối đa (¢)",
-            0.5,
-            10.0,
-            2.5,
-            0.5,
-            key="slip_cs2",
-        )
-        cs2_drop_warn = st.slider(
-            "Cảnh báo giá tụt sâu (¢)",
-            2.0,
-            15.0,
-            5.0,
-            1.0,
-            key="drop_cs2",
-        )
+        cs2_slip = st.slider("Trượt giá Ask tối đa (¢)", 0.5, 10.0, 2.5, 0.5, key="slip_cs2")
+        cs2_drop_warn = st.slider("Cảnh báo giá tụt sâu (¢)", 2.0, 15.0, 5.0, 1.0, key="drop_cs2")
         cs2_block_50_60 = st.checkbox("Chặn dải 50% – 60%", value=True, key="b5060_cs2")
         cs2_max_fav = st.slider("Chặn kèo chắc ăn trên (%)", 65, 99, 85, 5, key="fav_cs2")
-        cs2_blocked_kw = st.text_input(
-            "Giải chặn (CS2)",
-            value="CCT Europe",
-            key="blk_cs2",
-        )
+        cs2_blocked_kw = st.text_input("Giải chặn (CS2)", value="CCT Europe", key="blk_cs2")
         cs2_min_whale = cs2_min_bet / cs2_mult if cs2_mult > 0 else 0
         cs2_max_whale = cs2_max_cap / cs2_mult if cs2_mult > 0 else 0
         st.caption(f"Ngưỡng ví CS2: **${cs2_min_whale:,.0f} – ${cs2_max_whale:,.0f}**")
 
-    # --- PROFILE 2: DOTA 2 ---
-    with st.expander("🐉 Ví 2: DotaBotReborn (Post-Draft Taker)", expanded=True):
+    # --- PROFILE 2: DOTA 2 (TRIAL TUNED) ---
+    with st.expander("🐉 Ví 2: DotaBotReborn (Thử nghiệm Bot)", expanded=True):
         enable_dota = st.checkbox("Bật quét ví Dota 2", value=True, key="en_dota")
         dota_wallet_raw = st.text_input(
-            "Username hoặc Địa chỉ ví Dota",
-            value=DEFAULT_DOTA_INPUT,
+            "Địa chỉ ví Dota 2",
+            value=DEFAULT_DOTA_WALLET,
             key="w_dota",
-            help="Nhập @dotabotreborn (tool tự tra địa chỉ 0x...) hoặc dán trực tiếp địa chỉ 42 ký tự 0x...",
         ).strip()
 
         dota_mult = st.number_input(
-            "Hệ số nhân Dota",
+            "Hệ số nhân Dota (Thử nghiệm)",
             min_value=0.00001,
             max_value=1.0,
-            value=0.00400,
+            value=0.00250,
             step=0.00050,
             format="%.5f",
             key="m_dota",
-            help="Với hệ số 0.00400: lệnh $250 của DotaBotReborn -> bạn vào $1.00; lệnh $4,000 -> chạm trần $16.00.",
+            help="0.00250 cho giai đoạn thử nghiệm: lệnh $400 ví gốc -> $1.00; lệnh $4,000+ -> chạm trần $10.00.",
         )
         c2_a, c2_b = st.columns(2)
         dota_min_bet = c2_a.number_input(
@@ -880,44 +774,47 @@ with st.sidebar:
             value=1.00,
             step=0.5,
             key="min_dota",
-            help="0.00400 × $250 = $1.00 (loại toàn bộ lệnh thăm dò < $250).",
+            help="0.00250 × $400 = $1.00 (lọc sạch các lệnh thăm dò < $400).",
         )
         dota_max_cap = c2_b.number_input(
             "Trần tối đa ($)",
             min_value=1.0,
-            value=16.00,
+            value=10.00,
             step=1.0,
             key="max_dota",
+            help="Khóa trần $10.00/kèo (1% vốn $1,000) trong giai đoạn thử nghiệm.",
         )
-        dota_slip = st.slider(
-            "Trượt giá Ask tối đa (¢)",
-            0.5,
-            10.0,
-            2.5,
-            0.5,
-            key="slip_dota",
+        dota_g12_only = st.checkbox(
+            "Chỉ lấy Game 1 & Game 2 Winner",
+            value=True,
+            key="g12_dota",
+            help="Khuyên bật: Game 1/2 giữ +19.5% đến +23.9% ROI sau trượt giá, loại bỏ BO3 Match Winner dễ dính lệnh in-play.",
         )
+        dota_blocked_kw = st.text_input(
+            "Giải chặn (Dota)",
+            value="Streamer, Media Eleague",
+            key="blk_dota",
+            help="Chặn các giải biểu diễn của streamer Nga biến động bất thường.",
+        )
+        dota_slip = st.slider("Trượt giá Ask tối đa (¢)", 0.5, 10.0, 2.5, 0.5, key="slip_dota")
         dota_age_warn = st.slider(
-            "Cảnh báo trễ lệnh Taker sau (phút)",
+            "Cảnh báo trễ lệnh sau (phút)",
             3,
             30,
             10,
             1,
             key="age_dota",
-            help="DotaBotReborn đánh 1 nhịp trước giờ đấu; nếu trễ quá số phút này cần kiểm tra trận đã vào combat chưa.",
         )
         c2_p1, c2_p2 = st.columns(2)
         dota_min_prob = c2_p1.number_input("Dải giá từ (%)", 5, 60, 35, 5, key="minp_dota")
         dota_max_fav = c2_p2.number_input("Đến tối đa (%)", 50, 95, 70, 5, key="maxp_dota")
-        dota_block_50_60 = st.checkbox(
-            "Chặn dải 50% – 60% (Dota)",
-            value=False,
-            key="b5060_dota",
-            help="Tắt mặc định vì vùng 50-60% là vùng lãi cao nhất của DotaBotReborn (+35.7% ROI).",
-        )
+        dota_block_50_60 = st.checkbox("Chặn dải 50% – 60% (Dota)", value=False, key="b5060_dota")
+
         dota_min_whale = dota_min_bet / dota_mult if dota_mult > 0 else 0
         dota_max_whale = dota_max_cap / dota_mult if dota_mult > 0 else 0
-        st.caption(f"Ngưỡng ví Dota: **${dota_min_whale:,.0f} – ${dota_max_whale:,.0f}** | Dải **{dota_min_prob}%–{dota_max_fav}%**")
+        st.caption(
+            f"Ngưỡng ví Dota: **${dota_min_whale:,.0f} – ${dota_max_whale:,.0f}** | Dải **{dota_min_prob}%–{dota_max_fav}%**"
+        )
 
     detect_hedge_global = st.checkbox("Chặn kèo ví gốc Hedge 2 đầu (Chung)", value=True)
 
@@ -934,67 +831,58 @@ with st.sidebar:
 
 
 # ======================== MAIN UI ========================
-st.title("⚡ Trạm Quét Lệnh Copy-Trade Đa Chiến Lược (CS2 + Dota 2)")
+st.title("⚡ Trạm Quét Tín Hiệu Copy-Trade (CS2 + Dota 2)")
 
 col_btn, col_time = st.columns([2, 3])
-scan_clicked = col_btn.button("🚀 QUÉT LỆNH HỢP LỆ NGAY", type="primary", use_container_width=True)
+scan_clicked = col_btn.button("🚀 QUÉT TÍN HIỆU HỢP LỆ NGAY", type="primary", use_container_width=True)
 
 if scan_clicked or st.session_state["scan_results"] is None:
-    with st.spinner("Đang phân giải địa chỉ ví, kéo Polymarket Data API v2, Gamma & Sổ lệnh CLOB..."):
+    with st.spinner("Đang kéo dữ liệu Polymarket Data API v2, Gamma & Sổ lệnh CLOB..."):
         active_profiles: list[dict] = []
-        resolve_warnings: list[str] = []
 
-        if enable_cs2 and cs2_wallet_raw:
-            cs2_addr, cs2_err = resolve_wallet_address(cs2_wallet_raw)
-            if cs2_addr:
-                active_profiles.append(
-                    {
-                        "source_tag": "🎮 CS2",
-                        "wallet": cs2_addr,
-                        "multiplier": cs2_mult,
-                        "min_user_bet": cs2_min_bet,
-                        "max_user_cap": cs2_max_cap,
-                        "max_slippage_cents": cs2_slip,
-                        "drop_warn_cents": cs2_drop_warn,
-                        "min_prob_pct": 0,
-                        "max_fav_prob": cs2_max_fav,
-                        "block_50_60": cs2_block_50_60,
-                        "detect_hedge": detect_hedge_global,
-                        "blocked_keywords": [k.strip().lower() for k in cs2_blocked_kw.split(",") if k.strip()],
-                        "max_signal_age_mins": 0,
-                    }
-                )
-            elif cs2_err:
-                resolve_warnings.append(f"[CS2] {cs2_err}")
-
-        if enable_dota and dota_wallet_raw:
-            dota_addr, dota_err = resolve_wallet_address(
-                dota_wallet_raw,
-                expected_prefix=DOTA_WALLET_PREFIX if "dotabotreborn" in dota_wallet_raw.lower() else "",
+        if enable_cs2 and EVM_ADDR_RE.match(cs2_wallet_raw):
+            active_profiles.append(
+                {
+                    "source_tag": "🎮 CS2",
+                    "wallet": cs2_wallet_raw.lower(),
+                    "multiplier": cs2_mult,
+                    "min_user_bet": cs2_min_bet,
+                    "max_user_cap": cs2_max_cap,
+                    "max_slippage_cents": cs2_slip,
+                    "drop_warn_cents": cs2_drop_warn,
+                    "min_prob_pct": 0,
+                    "max_fav_prob": cs2_max_fav,
+                    "block_50_60": cs2_block_50_60,
+                    "detect_hedge": detect_hedge_global,
+                    "blocked_keywords": [k.strip().lower() for k in cs2_blocked_kw.split(",") if k.strip()],
+                    "required_market_substrings": [],
+                    "max_signal_age_mins": 0,
+                }
             )
-            if dota_addr:
-                active_profiles.append(
-                    {
-                        "source_tag": "🐉 Dota 2",
-                        "wallet": dota_addr,
-                        "multiplier": dota_mult,
-                        "min_user_bet": dota_min_bet,
-                        "max_user_cap": dota_max_cap,
-                        "max_slippage_cents": dota_slip,
-                        "drop_warn_cents": 5.0,
-                        "min_prob_pct": dota_min_prob,
-                        "max_fav_prob": dota_max_fav,
-                        "block_50_60": dota_block_50_60,
-                        "detect_hedge": detect_hedge_global,
-                        "blocked_keywords": [],
-                        "max_signal_age_mins": dota_age_warn,
-                    }
-                )
-            elif dota_err:
-                resolve_warnings.append(f"[Dota 2] {dota_err}")
+        elif enable_cs2:
+            st.warning("Địa chỉ ví CS2 chưa đúng định dạng 42 ký tự 0x...")
 
-        for w_msg in resolve_warnings:
-            st.warning(w_msg)
+        if enable_dota and EVM_ADDR_RE.match(dota_wallet_raw):
+            active_profiles.append(
+                {
+                    "source_tag": "🐉 Dota 2",
+                    "wallet": dota_wallet_raw.lower(),
+                    "multiplier": dota_mult,
+                    "min_user_bet": dota_min_bet,
+                    "max_user_cap": dota_max_cap,
+                    "max_slippage_cents": dota_slip,
+                    "drop_warn_cents": 5.0,
+                    "min_prob_pct": dota_min_prob,
+                    "max_fav_prob": dota_max_fav,
+                    "block_50_60": dota_block_50_60,
+                    "detect_hedge": detect_hedge_global,
+                    "blocked_keywords": [k.strip().lower() for k in dota_blocked_kw.split(",") if k.strip()],
+                    "required_market_substrings": ["game 1 winner", "game 2 winner"] if dota_g12_only else [],
+                    "max_signal_age_mins": dota_age_warn,
+                }
+            )
+        elif enable_dota:
+            st.warning("Địa chỉ ví Dota 2 chưa đúng định dạng 42 ký tự 0x...")
 
         if not active_profiles:
             st.error("Chưa có ví hợp lệ nào được bật để quét.")
@@ -1024,23 +912,6 @@ if st.session_state["last_scan_time"]:
     wallets_badge = " | ".join(f"{tag}: `{addr[:8]}...{addr[-4:]}`" for tag, addr in res_meta.items())
     col_time.info(f"🕒 Cập nhật: **{st.session_state['last_scan_time']}** • {wallets_badge}")
 
-with st.expander("📋 So Sánh Nhanh Bộ Quy Tắc 2 Ví Đang Chạy Song Song (Bấm để xem)", expanded=False):
-    r_col1, r_col2 = st.columns(2)
-    with r_col1:
-        st.markdown(
-            "**🎮 Chiến lược 1: CS2 Whale (Pre-Match)**\n"
-            f"* **Ngưỡng vốn:** Ví gốc `>= ${cs2_min_whale:,.0f}` (bạn vào `${cs2_min_bet:.2f} – ${cs2_max_cap:.2f}`).\n"
-            f"* **Dải giá & Giải:** Lấy `< 50%` và `60% – {cs2_max_fav}%`; chặn `50%–60%`, Hedge 2 đầu & **{cs2_blocked_kw}**.\n"
-            f"* **Đặc thù:** Gom nhiều lệnh trước giờ đấu, chỉ cần kiểm tra trận chưa đá Live."
-        )
-    with r_col2:
-        st.markdown(
-            "**🐉 Chiến lược 2: DotaBotReborn (Post-Draft Taker)**\n"
-            f"* **Ngưỡng vốn:** Ví gốc `>= ${dota_min_whale:,.0f}` (bạn vào `${dota_min_bet:.2f} – ${dota_max_cap:.2f}`).\n"
-            f"* **Dải giá:** Lấy **`{dota_min_prob}% – {dota_max_fav}%`** (mở khóa `50%–60%`, chặn `> {dota_max_fav}%` và `< {dota_min_prob}%`).\n"
-            f"* **Đặc thù:** Đánh 1 nhịp Taker ngay trước giờ game bắt đầu -> ưu tiên lệnh mới `<= {dota_age_warn} phút` và trượt giá `<= +{dota_slip:.1f}¢`."
-        )
-
 res = st.session_state["scan_results"]
 if res is not None:
     valid_df: pd.DataFrame = res["valid"].copy()
@@ -1068,7 +939,7 @@ if res is not None:
     m1.metric("🟢 Kèo hợp lệ ngay", len(valid_df))
     m2.metric("💰 Vốn cần thêm ($)", f"${remaining_capital:.2f}")
     m3.metric("🟡 Quá trượt giá (Limit)", len(slip_df))
-    m4.metric("🚫 Giải chặn (CCT EU)", len(blocked_df))
+    m4.metric("🚫 Giải chặn", len(blocked_df))
     m5.metric("🏆 Chờ Redeem / Xác 0¢", f"{redeem_cnt} / {dead_zero_cnt}")
 
     st.divider()
@@ -1167,9 +1038,6 @@ if res is not None:
     # --- MỤC 2: KÈO ĐẠT ĐIỀU KIỆN NHƯNG QUÁ TRƯỢT GIÁ ASK ---
     if not slip_df.empty:
         st.subheader(f"🟡 2. Kèo Đạt Điều Kiện Nhưng Quá Trượt Giá Ask ({len(slip_df)})")
-        st.caption(
-            "Giá Ask trên sổ lệnh đang cao hơn trần cho phép; chỉ đặt lệnh Limit ở cột **🛑 Giá trần** nếu trận chưa bắt đầu."
-        )
         slip_df["entered"] = slip_df["pos_key"].isin(st.session_state["entered_ids"])
         disp_slip = slip_df[
             [
@@ -1277,9 +1145,9 @@ if res is not None:
             },
         )
 
-    # --- MỤC 4: BẢNG THEO DÕI RIÊNG GIẢI CHẶN (CCT EUROPE) ---
+    # --- MỤC 4: BẢNG THEO DÕI RIÊNG GIẢI CHẶN ---
     if not blocked_df.empty:
-        st.subheader(f"🚫 4. Bảng Theo Dõi Riêng: Giải Chặn — {cs2_blocked_kw} ({len(blocked_df)})")
+        st.subheader(f"🚫 4. Bảng Theo Dõi Riêng: Giải Chặn ({len(blocked_df)})")
         disp_blk = blocked_df[
             [
                 "source_tag",
