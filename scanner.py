@@ -17,7 +17,7 @@ st.set_page_config(
 )
 
 DEFAULT_CS2_WALLET = "0xc9bfc7986767173b4f1c3fc9b2c6b255fc7381c0"
-DEFAULT_DOTA_INPUT = "@dotabotreborn"
+DEFAULT_DOTA_INPUT = "0x3231d2d67053e5dc3715f6429124741e52866e75"
 DOTA_WALLET_PREFIX = "0x3231d2d67053c5dc3715f64291"
 
 DATA_API_BASE = "https://data-api.polymarket.com"
